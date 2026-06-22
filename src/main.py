@@ -4,23 +4,21 @@ import re
 import subprocess
 from typing import TypedDict, List, Dict, Any
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from langchain_core.messages import SystemMessage, HumanMessage
 from langgraph.graph import StateGraph, END
 
 # Use ChatOpenAI or ChatOllama based on availability
 try:
-    from langchain_community.chat_models import ChatOllama
+    from langchain_google_genai import ChatGoogleGenerativeAI
 except ImportError:
     pass
 
-try:
-    from langchain_openai import ChatOpenAI
-except ImportError:
-    pass
-
-# Initialize LLMs (Update models/API keys as needed)
-llm_local_distiller = ChatOllama(model="qwen2.5-coder:3b") # Inferred from ollama_data
-llm_cloud = ChatOpenAI(model="gpt-4o", temperature=0) # Update if using a different cloud provider
+# Initialize LLMs (Requires GOOGLE_API_KEY environment variable)
+llm_fast = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0) # Fast model
+llm_heavy = ChatGoogleGenerativeAI(model="gemini-3.1-pro", temperature=0) # Heavy model
 
 class SwarmState(TypedDict):
     messages: List[Any]
@@ -62,7 +60,7 @@ def architect_node(state: SwarmState):
     system = "You are a software architect. Create a brief plan for the following request."
     
     try:
-        res = llm_cloud.invoke([SystemMessage(content=system), HumanMessage(content=prompt)])
+        res = llm_heavy.invoke([SystemMessage(content=system), HumanMessage(content=prompt)])
         plan = res.content
     except Exception as e:
         plan = f"Fallback plan due to error: {str(e)}"
@@ -77,7 +75,7 @@ def environment_node(state: SwarmState):
     system = "List Python dependencies for this plan as a requirements.txt file. Output ONLY valid requirements.txt content."
     
     try:
-        res = llm_local_distiller.invoke([SystemMessage(content=system), HumanMessage(content=plan)])
+        res = llm_fast.invoke([SystemMessage(content=system), HumanMessage(content=plan)])
         reqs = res.content.strip()
     except Exception:
         reqs = "pytest\nhypothesis"
@@ -119,7 +117,7 @@ def cloud_synthesizer(state: SwarmState):
         prompt += f"AVOID these failed approaches:\n" + "\n".join(graveyard[-2:]) # Show last 2 failures
         
     try:
-        response = llm_cloud.invoke([SystemMessage(content=system), HumanMessage(content=prompt)])
+        response = llm_heavy.invoke([SystemMessage(content=system), HumanMessage(content=prompt)])
         content = response.content if hasattr(response, 'content') else ""
         
         new_files = {}
@@ -231,7 +229,7 @@ def error_distiller(state: SwarmState):
     ]
     
     try:
-        res = llm_local_distiller.invoke(prompt)
+        res = llm_fast.invoke(prompt)
         brief = res.content
     except Exception:
         brief = raw_error[:300]
@@ -255,7 +253,7 @@ def archivist_node(state: SwarmState):
     prompt = f"Current Ledger:\n{ledger}\n\nSuccessful Plan:\n{plan}"
     
     try:
-        res = llm_local_distiller.invoke([SystemMessage(content=system), HumanMessage(content=prompt)])
+        res = llm_fast.invoke([SystemMessage(content=system), HumanMessage(content=prompt)])
         new_ledger = res.content
         
         with open(os.path.join(workspace, ".architecture.md"), "w") as f:
