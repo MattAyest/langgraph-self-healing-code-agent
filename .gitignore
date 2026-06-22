@@ -1,0 +1,32 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Environment variables
+.env
+.env.local
+
+# LangGraph / Swarm Output directories
+.workspaces/
+
+# Ollama Data & Models
+ollama_data/
+
+# Testing and Coverage
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# Docker
+docker-compose.override.yml
+
+# OS generated files
+.DS_Store
+Thumbs.db
