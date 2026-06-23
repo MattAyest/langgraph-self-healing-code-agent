@@ -3,6 +3,7 @@ import ast
 import re
 import json
 import socket
+import shutil
 import subprocess
 from typing import TypedDict, List, Dict, Any
 
@@ -113,61 +114,120 @@ def environment_node(state: SwarmState):
     if reqs and "```" not in reqs: # rudimentary safety check
         manifest["requirements.txt"] = reqs
         
-    return {"file_manifest": manifest, "next_node": "cloud_synthesizer"}
+    return {"file_manifest": manifest, "next_node": "code_writer"}
 
 # ---------------------------------------------------------
 # NODE: LOCAL SYNTHESIZER
 # ---------------------------------------------------------
 def local_synthesizer(state: SwarmState):
     # Fallback to cloud if local isn't implemented or complex
-    return {"next_node": "cloud_synthesizer"}
+    return {"next_node": "code_writer"}
 
 # ---------------------------------------------------------
-# NODE: CLOUD SYNTHESIZER
+# NODE: CODE WRITER
+# Generates only implementation files (src/) and requirements.txt.
+# Test files are handled by the separate test_writer node.
 # ---------------------------------------------------------
-def cloud_synthesizer(state: SwarmState):
+def code_writer(state: SwarmState):
     prompt = state.get("messages", [])[-1].content
     plan = state.get("architectural_plan", "")
     errors = state.get("verification_errors", "")
     graveyard = state.get("rollback_graveyard", [])
-    
+
     system = (
         "You are a master Python programmer. Output your code wrapped in XML tags like this:\n"
-        "<file name=\"main.py\">\nprint('hello')\n</file>\n"
+        "<file name=\"src/main.py\">\nprint('hello')\n</file>\n"
         "RULES:\n"
         "1. All source files go in a src/ subdirectory. Always include a src/__init__.py.\n"
-        "2. ALL test files must be placed under a tests/ subdirectory and named test_*.py.\n"
-        "3. Always include a tests/__init__.py file.\n"
-        "4. Do not place any source or test files in the root directory.\n"
-        "5. In test files, import from src (e.g. from src.module import thing).\n"
-        "6. Output raw Python code inside the XML tags — no markdown fences."
+        "2. Always output a <file name=\"requirements.txt\"> listing every third-party dependency.\n"
+        "3. Do NOT output any test files — a dedicated test writer handles those.\n"
+        "4. Output raw Python code inside the XML tags — no markdown fences."
     )
-    
-    if plan:
-        prompt += f"\n\nArchitecture Plan to follow:\n{plan}"
 
+    if plan:
+        prompt += f"\n\nArchitecture Plan:\n{plan}"
     if errors:
-        prompt += f"Previous Test Trace:\n{errors}\n\nFix the logic."
+        prompt += f"\n\nPrevious test failures — fix the implementation:\n{errors}"
     if graveyard:
-        prompt += f"AVOID these failed approaches:\n" + "\n".join(graveyard[-2:]) # Show last 2 failures
-        
+        prompt += f"\n\nAVOID these failed approaches:\n" + "\n".join(graveyard[-2:])
+
     try:
         response = llm_heavy.invoke([SystemMessage(content=system), HumanMessage(content=prompt)])
         content = response.content if hasattr(response, 'content') else ""
-        
+
         new_files = {}
         matches = re.finditer(r'<file name=[\'"](.*?)[\'"]>\s*(.*?)\s*</file>', content, re.DOTALL | re.IGNORECASE)
         for match in matches:
             code = match.group(2).strip()
             code = re.sub(r'^```[a-zA-Z]*\n?', '', code).rstrip('`').strip()
-            new_files[match.group(1).strip()] = code
-            
+            filename = match.group(1).strip()
+            # Accept only src/ files and requirements.txt — reject any test files the LLM sneaks in
+            if filename.startswith("src/") or filename == "requirements.txt":
+                new_files[filename] = code
+
         if not new_files:
             raise ValueError("Failed XML formatting.")
-            
-        return {"file_manifest": new_files, "next_node": "static_analyzer"}
+
+        # Fall back to architect-generated requirements.txt if code writer didn't emit one
+        existing_manifest = state.get("file_manifest", {})
+        if "requirements.txt" not in new_files and "requirements.txt" in existing_manifest:
+            new_files["requirements.txt"] = existing_manifest["requirements.txt"]
+
+        return {"file_manifest": new_files, "next_node": "test_writer"}
     except Exception as e:
-        return {"verification_errors": f"Synthesis Error: {str(e)}", "next_node": "error_distiller"}
+        return {"verification_errors": f"Code Writer Error: {str(e)}", "next_node": "error_distiller"}
+
+# ---------------------------------------------------------
+# NODE: TEST WRITER
+# Receives the generated source code and writes the test suite against it.
+# Keeps src/ files untouched; merges test files into the manifest.
+# ---------------------------------------------------------
+def test_writer(state: SwarmState):
+    manifest = state.get("file_manifest", {})
+    errors = state.get("verification_errors", "")
+
+    source_context = "\n\n".join(
+        f"# {filename}\n{code}"
+        for filename, code in manifest.items()
+        if filename.startswith("src/") and filename.endswith(".py")
+    )
+
+    system = (
+        "You are a Python test engineer. Given source code, write a comprehensive pytest test suite.\n"
+        "Output test files wrapped in XML tags like this:\n"
+        "<file name=\"tests/test_main.py\">\n...\n</file>\n"
+        "RULES:\n"
+        "1. ALL test files go in a tests/ subdirectory named test_*.py.\n"
+        "2. Always include a tests/__init__.py file.\n"
+        "3. Import from src (e.g. from src.module import thing).\n"
+        "4. Use pytest and hypothesis for property-based testing where appropriate.\n"
+        "5. Output raw Python code inside the XML tags — no markdown fences.\n"
+        "6. Only output test files — do not output source or requirements files."
+    )
+
+    user_prompt = f"Source Code:\n{source_context}"
+    if errors:
+        user_prompt += f"\n\nPrevious test failures — revise the tests accordingly:\n{errors}"
+
+    try:
+        response = llm_heavy.invoke([SystemMessage(content=system), HumanMessage(content=user_prompt)])
+        content = response.content if hasattr(response, 'content') else ""
+
+        test_files = {}
+        matches = re.finditer(r'<file name=[\'"](.*?)[\'"]>\s*(.*?)\s*</file>', content, re.DOTALL | re.IGNORECASE)
+        for match in matches:
+            code = match.group(2).strip()
+            code = re.sub(r'^```[a-zA-Z]*\n?', '', code).rstrip('`').strip()
+            filename = match.group(1).strip()
+            if filename.startswith("tests/"):
+                test_files[filename] = code
+
+        if not test_files:
+            raise ValueError("No test files generated.")
+
+        return {"file_manifest": {**manifest, **test_files}, "next_node": "static_analyzer"}
+    except Exception as e:
+        return {"verification_errors": f"Test Writer Error: {str(e)}", "next_node": "error_distiller"}
 
 # ---------------------------------------------------------
 # NODE: STATIC ANALYZER
@@ -195,7 +255,7 @@ def deterministic_verifier(state: SwarmState):
     workspace = state.get("workspace_dir", ".workspaces/default")
     manifest = state.get("file_manifest", {})
     loops = state.get("loop_count", 0) + 1
-    
+
     pytest_ini = "[pytest]\ntestpaths = tests\npythonpath = .\n"
     with open(os.path.join(workspace, "pytest.ini"), "w") as f:
         f.write(pytest_ini)
@@ -205,35 +265,82 @@ def deterministic_verifier(state: SwarmState):
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w") as f:
             f.write(code)
-    
-    docker_cmd = [
-        "docker", "run", "--rm",
-        "--memory", "512m", "--cpus", "1.0",
-        "-e", "PIP_ROOT_USER_ACTION=ignore",
-        "-e", "PIP_DISABLE_PIP_VERSION_CHECK=1",
-        "-v", f"{resolve_host_path(workspace)}:/workspace",
+
+    # Fix A: clear stale deps so a changed requirements.txt on retry gets a clean install
+    deps_dir = os.path.join(workspace, ".deps")
+    if os.path.exists(deps_dir):
+        shutil.rmtree(deps_dir)
+
+    host_workspace = resolve_host_path(workspace)
+
+    # Flags shared by both phases
+    hardening_flags = [
+        "--memory", "512m",
+        "--memory-swap", "512m",        # disable swap beyond RAM limit
+        "--cpus", "1.0",
+        "--pids-limit", "64",           # prevent fork bombs
+        "--ulimit", "nofile=1024:1024", # cap open file descriptors
+        "--cap-drop", "ALL",            # drop all Linux capabilities
+        "--security-opt", "no-new-privileges",
+        "-v", f"{host_workspace}:/workspace",
         "-w", "/workspace",
         "python:3.11-slim",
-        "bash", "-c", "if [ -f requirements.txt ]; then pip install -q -r requirements.txt 2>/dev/null; else pip install -q hypothesis pytest 2>/dev/null; fi && pytest"
     ]
-    
+
+    # Phase 1: install dependencies (network allowed; no user code executes here).
+    # Packages land in /workspace/.deps — a subdirectory of the volume mount —
+    # so nothing installs into the container's own site-packages.
+    # stderr is NOT suppressed so install failures surface clearly (fix B).
+    install_script = (
+        "if [ -f requirements.txt ]; then "
+        "pip install -q --target /workspace/.deps -r requirements.txt; "
+        "else "
+        "pip install -q --target /workspace/.deps hypothesis pytest; "
+        "fi"
+    )
+    install_cmd = (
+        ["docker", "run", "--rm"]
+        + hardening_flags
+        + ["-e", "PIP_ROOT_USER_ACTION=ignore", "-e", "PIP_DISABLE_PIP_VERSION_CHECK=1"]
+        + ["bash", "-c", install_script]
+    )
+
+    # Phase 2: run tests — network fully disabled so generated code cannot make outbound calls.
+    # PYTHONPATH points at the deps installed in phase 1.
+    test_cmd = (
+        ["docker", "run", "--rm", "--network", "none"]
+        + hardening_flags
+        + ["-e", "PYTHONPATH=/workspace/.deps"]
+        + ["python", "-m", "pytest"]
+    )
+
     try:
+        # Fix B: check install return code and surface failures rather than silently ignoring them
+        install_res = subprocess.run(install_cmd, capture_output=True, text=True, timeout=90)
+        if install_res.returncode != 0:
+            install_error = f"DEPENDENCY INSTALL FAILED:\nSTDOUT:\n{install_res.stdout}\nSTDERR:\n{install_res.stderr}"
+            return {
+                "verification_errors": install_error,
+                "loop_count": loops,
+                "next_node": "error_distiller" if loops < 10 else "FINISH"
+            }
+
         # Hard 120 second timeout for complex fuzzing matrices
-        res = subprocess.run(docker_cmd, capture_output=True, text=True, timeout=120)
-        
+        res = subprocess.run(test_cmd, capture_output=True, text=True, timeout=120)
+
         if res.returncode == 0:
             return {"loop_count": loops, "verification_errors": "", "regression_count": 0, "next_node": "archivist_node"}
-            
+
         error_output = f"STDOUT:\n{res.stdout}\n\nSTDERR:\n{res.stderr}"
         return {
-            "verification_errors": error_output, 
-            "loop_count": loops, 
+            "verification_errors": error_output,
+            "loop_count": loops,
             "next_node": "error_distiller" if loops < 10 else "FINISH"
         }
     except subprocess.TimeoutExpired:
         return {
-            "verification_errors": "Execution Error: Test suite timed out (120s limit reached). Infinite loop or heavy fuzzing detected.", 
-            "loop_count": loops, 
+            "verification_errors": "Execution Error: Test suite timed out (120s limit reached). Infinite loop or heavy fuzzing detected.",
+            "loop_count": loops,
             "next_node": "error_distiller" if loops < 10 else "FINISH"
         }
 
@@ -276,10 +383,10 @@ def error_distiller(state: SwarmState):
         brief = raw_error[:300]
         
     return {
-        "verification_errors": brief, 
+        "verification_errors": brief,
         "rollback_graveyard": graveyard,
         "regression_count": regression_count,
-        "next_node": "cloud_synthesizer"
+        "next_node": "code_writer"
     }
 
 # ---------------------------------------------------------
@@ -314,7 +421,8 @@ workflow.add_node("speculative_router", speculative_router)
 workflow.add_node("architect_node", architect_node)
 workflow.add_node("environment_node", environment_node)
 workflow.add_node("local_synthesizer", local_synthesizer)
-workflow.add_node("cloud_synthesizer", cloud_synthesizer)
+workflow.add_node("code_writer", code_writer)
+workflow.add_node("test_writer", test_writer)
 workflow.add_node("static_analyzer", static_analyzer)
 workflow.add_node("deterministic_verifier", deterministic_verifier)
 workflow.add_node("error_distiller", error_distiller)
@@ -325,12 +433,13 @@ workflow.set_entry_point("workspace_loader")
 workflow.add_conditional_edges("workspace_loader", lambda x: x["next_node"], {"speculative_router": "speculative_router"})
 workflow.add_conditional_edges("speculative_router", lambda x: x["next_node"], {"local_synthesizer": "local_synthesizer", "architect_node": "architect_node"})
 workflow.add_conditional_edges("architect_node", lambda x: x["next_node"], {"environment_node": "environment_node"})
-workflow.add_conditional_edges("environment_node", lambda x: x["next_node"], {"cloud_synthesizer": "cloud_synthesizer"})
-workflow.add_conditional_edges("local_synthesizer", lambda x: x["next_node"], {"static_analyzer": "static_analyzer", "cloud_synthesizer": "cloud_synthesizer"})
-workflow.add_conditional_edges("cloud_synthesizer", lambda x: x["next_node"], {"static_analyzer": "static_analyzer", "error_distiller": "error_distiller"})
+workflow.add_conditional_edges("environment_node", lambda x: x["next_node"], {"code_writer": "code_writer"})
+workflow.add_conditional_edges("local_synthesizer", lambda x: x["next_node"], {"code_writer": "code_writer"})
+workflow.add_conditional_edges("code_writer", lambda x: x["next_node"], {"test_writer": "test_writer", "error_distiller": "error_distiller"})
+workflow.add_conditional_edges("test_writer", lambda x: x["next_node"], {"static_analyzer": "static_analyzer", "error_distiller": "error_distiller"})
 workflow.add_conditional_edges("static_analyzer", lambda x: x["next_node"], {"deterministic_verifier": "deterministic_verifier", "error_distiller": "error_distiller"})
 workflow.add_conditional_edges("deterministic_verifier", lambda x: x["next_node"], {"error_distiller": "error_distiller", "archivist_node": "archivist_node", "FINISH": END})
-workflow.add_conditional_edges("error_distiller", lambda x: x["next_node"], {"cloud_synthesizer": "cloud_synthesizer", "architect_node": "architect_node", "FINISH": END})
+workflow.add_conditional_edges("error_distiller", lambda x: x["next_node"], {"code_writer": "code_writer", "architect_node": "architect_node", "FINISH": END})
 workflow.add_conditional_edges("archivist_node", lambda x: x["next_node"], {"FINISH": END})
 
 app = workflow.compile()
