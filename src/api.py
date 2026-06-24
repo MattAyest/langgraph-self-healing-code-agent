@@ -6,7 +6,7 @@ from pydantic import BaseModel
 from langchain_core.messages import HumanMessage
 from typing import Dict, Any
 
-from .main import app as swarm_graph
+from .graph import app as swarm_graph
 
 app = FastAPI(title="Coding Module Microservice")
 
@@ -23,6 +23,7 @@ class TaskStatusResponse(BaseModel):
     current_node: str | None = None
     loop_count: int = 0
     regression_count: int = 0
+    replan_count: int = 0
     workspace: str
     result: Dict[str, Any] | None = None
     error: str | None = None
@@ -46,6 +47,8 @@ async def run_swarm_task(task_id: str, prompt: str, workspace_dir: str):
                     tasks_db[task_id]["loop_count"] = state_update["loop_count"]
                 if "regression_count" in state_update:
                     tasks_db[task_id]["regression_count"] = state_update["regression_count"]
+                if "replan_count" in state_update:
+                    tasks_db[task_id]["replan_count"] = state_update["replan_count"]
                 if "verification_errors" in state_update:
                     tasks_db[task_id]["latest_verification_error"] = state_update["verification_errors"]
                 if "file_manifest" in state_update:
@@ -75,6 +78,7 @@ async def generate_code(request: TaskRequest, background_tasks: BackgroundTasks)
         "current_node": "initializing",
         "loop_count": 0,
         "regression_count": 0,
+        "replan_count": 0,
         "workspace": workspace_dir,
         "result": None,
         "error": None,
