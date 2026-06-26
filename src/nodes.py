@@ -193,6 +193,24 @@ def _diag(workspace: str, node: str, detail: str) -> None:
         print(f"[_diag] write failed for {workspace}: {e}", file=sys.stderr)
 
 
+def _invoke_with_retry(node_name: str, messages, workspace: str = "", max_attempts: int = 3):
+    """Call a node's LLM, retrying on transient errors (network drops, SSL EOF,
+    incomplete reads). These are infrastructure faults, not problems with the
+    prompt or the code, so retrying at the source keeps them from cascading into
+    the fault classifier as a false 'implementation' fault. Returns the response
+    content string; re-raises the last error if every attempt fails."""
+    last_error = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = get_llm(node_name).invoke(messages)
+            return response.content if hasattr(response, "content") else ""
+        except Exception as e:
+            last_error = e
+            if workspace:
+                _diag(workspace, node_name, f"LLM attempt {attempt}/{max_attempts} failed: {e}")
+    raise last_error
+
+
 # ---------------------------------------------------------
 # HELPER: Resolve host-side path for a container-internal path.
 # Docker sets the container hostname to the container ID, so we can
@@ -288,10 +306,11 @@ def architect_node(state: SwarmState):
         )
 
     try:
-        res = get_llm("architect_node").invoke(
-            [SystemMessage(content=system), HumanMessage(content=user_prompt)]
+        content = _invoke_with_retry(
+            "architect_node",
+            [SystemMessage(content=system), HumanMessage(content=user_prompt)],
+            state.get("workspace_dir", ""),
         )
-        content = res.content
 
         plan_match = re.search(
             r"<plan>(.*?)</plan>", content, re.DOTALL | re.IGNORECASE
@@ -369,10 +388,11 @@ def test_writer(state: SwarmState):
         )
 
     try:
-        response = get_llm("test_writer").invoke(
-            [SystemMessage(content=system), HumanMessage(content=user_prompt)]
+        content = _invoke_with_retry(
+            "test_writer",
+            [SystemMessage(content=system), HumanMessage(content=user_prompt)],
+            state.get("workspace_dir", ""),
         )
-        content = response.content if hasattr(response, "content") else ""
 
         test_files = {}
         matches = re.finditer(
@@ -693,16 +713,17 @@ def deterministic_verifier(state: SwarmState):
     with open(os.path.join(workspace, "conftest.py"), "w") as f:
         f.write(conftest)
 
+    # Clear stale src/ BEFORE writing the manifest, so orphan files from a previous
+    # loop don't persist while the fresh manifest files are written in clean.
+    src_dir = os.path.join(workspace, "src")
+    if os.path.exists(src_dir):
+        shutil.rmtree(src_dir)
+
     for filename, code in manifest.items():
         filepath = os.path.join(workspace, filename)
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         with open(filepath, "w") as f:
             f.write(code)
-
-    # Clear stale src/ so orphan files from a previous loop don't persist on disk.
-    src_dir = os.path.join(workspace, "src")
-    if os.path.exists(src_dir):
-        shutil.rmtree(src_dir)
 
     # Clear stale deps so a changed requirements.txt on retry gets a clean install.
     # Pre-create so the container user (running as host UID) can write into it.

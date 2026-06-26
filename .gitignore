@@ -15,6 +15,9 @@ env/
 # LangGraph / Swarm Output directories
 .workspaces/
 
+# Benchmark run output (append-only history; runner.py + questions.json are kept)
+benchmarks/results.jsonl
+
 # Ollama Data & Models
 ollama_data/
 

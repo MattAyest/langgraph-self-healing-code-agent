@@ -35,10 +35,10 @@ error_distiller ──► code_writer  (impl)     │
 
 ### How it works
 
-1. **Architect** designs a module and writes a formal interface contract (signatures, exceptions, edge cases).
-2. **Test writer** writes a pytest suite from the contract — never sees the implementation.
-3. **Contract verifier** checks (cheaply) that the tests actually match the contract; retries up to 3 times.
-4. **Code writer** implements the code to pass the frozen tests.
+1. **Architect** acts as a systems/data engineer: defines the architectural shape and a precise behavioral contract (signatures, return guarantees, raise-rules stated as rules rather than enumerated lists).
+2. **Test writer** writes a pytest suite that verifies the contract — never sees the implementation. Imports from `src.main`.
+3. **Contract verifier** checks (cheaply) that the tests faithfully reflect what the contract explicitly states; retries up to 3 times.
+4. **Code writer** implements the contract (not the tests) in `src/main.py` — correct behavior makes the tests pass as a consequence.
 5. **Static analyzer** catches syntax errors deterministically before running Docker.
 6. **Deterministic verifier** installs deps and runs pytest inside a hardened `python:3.11-slim` sibling container (network disabled during test run).
 7. **Error distiller** classifies failures as `implementation`, `tests`, or `spec` faults and routes accordingly. On success, it does a semantic contract check to catch hardcoded outputs or loopholes.
@@ -50,12 +50,16 @@ Every node picks its own provider and model via `llm_config.yaml` — change mod
 
 | Node | Model | Tier |
 |---|---|---|
-| architect_node | kimi-k2.7-code:cloud | premium |
-| test_writer | qwen3-coder:480b | heavy |
-| contract_verifier | gpt-oss:20b | light |
-| code_writer | qwen3-coder:480b | heavy |
-| error_distiller | gpt-oss:120b | medium |
-| archivist_node | gpt-oss:20b | light |
+| architect_node | kimi-k2.7-code:cloud | premium (deep design reasoning) |
+| test_writer | minimax-m3:cloud | heavy (predictable-latency coder) |
+| contract_verifier | nemotron-3-nano:30b-cloud | medium-light |
+| code_writer | minimax-m3:cloud | heavy (predictable-latency coder) |
+| error_distiller | nemotron-3-nano:30b-cloud | medium |
+| archivist_node | nemotron-3-nano:30b-cloud | light |
+
+The writer nodes use **minimax-m3** rather than a reasoning model: implementing an
+already-precise contract needs consistent latency, not extended chain-of-thought.
+The architect keeps a reasoning model where designing the contract pays for it.
 
 To escalate a node to a frontier API, swap the provider/model in `llm_config.yaml` — no rebuild needed.
 

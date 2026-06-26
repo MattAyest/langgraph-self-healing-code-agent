@@ -59,7 +59,7 @@ nodes:
     # WORKLOAD: heavy — needs solid coding + hypothesis fluency.
     test_writer:
         provider: "ollama-cloud"
-        model: "kimi-k2.7-code:cloud"
+        model: "minimax-m3:cloud"
         temperature: 0.3
         api_key_env_var: "OLLAMA_API_KEY"
         # Alternatives: nemotron-3-nano:30b-cloud (ollama-cloud) | kimi-k2.7-code:cloud (ollama-cloud)
@@ -76,7 +76,7 @@ nodes:
     # WORKLOAD: premium — heaviest coding in the pipeline.
     code_writer:
         provider: "ollama-cloud"
-        model: "kimi-k2.7-code:cloud"
+        model: "minimax-m3:cloud"
         temperature: 0.1
         api_key_env_var: "OLLAMA_API_KEY"
         # Recommended escalation for the very heaviest lifting:
