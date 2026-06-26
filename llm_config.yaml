@@ -1,47 +1,111 @@
+# =============================================================================
+# PER-NODE LLM CONFIGURATION
+# =============================================================================
+# Each pipeline node picks its own supplier + model. Set these at install time.
+#
+#   provider:         google-genai | openai | anthropic | ollama-cloud | ollama | openai-compatible
+#   model:            the model id for that provider
+#   temperature:      sampling temperature
+#   api_key_env_var:  name of the env var holding the credential (see notes below)
+#   base_url:         (openai-compatible only) URL of the self-hosted server
+#
+# PROVIDER NOTES
+#   ollama-cloud       -> hosted Ollama (https://ollama.com). Workhorse default.
+#                         api_key_env_var must name your OLLAMA_API_KEY env var.
+#                         Live model catalog: https://ollama.com/search?c=cloud
+#   ollama             -> self-hosted / local Ollama daemon. api_key_env_var
+#                         (optional) names the base-URL env var; defaults to
+#                         http://localhost:11434.
+#   openai-compatible  -> any self-hosted OpenAI-API server (vLLM, LocalAI,
+#                         LM Studio, llama.cpp, ...). Needs `base_url`; the
+#                         api_key_env_var is optional.
+#   google-genai       -> Gemini. api_key_env_var -> GOOGLE_API_KEY
+#   openai             -> GPT.    api_key_env_var -> OPENAI_API_KEY
+#   anthropic          -> Claude. api_key_env_var -> ANTHROPIC_API_KEY
+#
+# SELF-HOSTING FROM DOCKER: if the orchestrator runs in a container and your
+# model server runs on the host, "localhost" points at the container, not the
+# host. Use the host's LAN IP, or host.docker.internal (add to docker-compose:
+#   extra_hosts: ["host.docker.internal:host-gateway"]  on Linux).
+# Example self-hosted nodes:
+#   provider: "ollama"             model: "qwen2.5-coder:32b"  api_key_env_var: "OLLAMA_BASE_URL"
+#   provider: "openai-compatible"  model: "your-model"  base_url: "http://host.docker.internal:8001/v1"
+#
+# WORKLOAD TIERS (rough guide for choosing models)
+#   light   -> short classify/summarize calls         e.g. gpt-oss:20b
+#   heavy   -> strong coding / long reasoning          e.g. qwen3-coder:480b, gpt-oss:120b
+#   premium -> the "very heaviest lifting" — escalate to a frontier API
+#              (gemini-2.5-pro, claude-3-5-sonnet, gpt-4o) if Ollama quality
+#              is not good enough on the architect / code_writer nodes.
+#
+# Defaults below run the whole pipeline on an Ollama Cloud (Pro) account with a
+# single OLLAMA_API_KEY. The two heaviest nodes are marked so you can escalate
+# them to a premium API by swapping the commented block in.
+# =============================================================================
+
 nodes:
-  architect_node:
-    provider: "google-genai"
-    model: "gemini-2.5-pro"
-    temperature: 0.2
-    api_key_env_var: "GOOGLE_API_KEY"
+    # Designs the module and writes the formal interface contract.
+    # WORKLOAD: premium — hardest reasoning in the pipeline.
+    architect_node:
+        provider: "ollama-cloud"
+        model: "kimi-k2.7-code:cloud"
+        temperature: 0.2
+        api_key_env_var: "OLLAMA_API_KEY"
+        # Recommended escalation for the very heaviest lifting:
+        #   provider: "google-genai"   model: "gemini-2.5-pro"            api_key_env_var: "GOOGLE_API_KEY"
+        #   provider: "anthropic"      model: "claude-3-5-sonnet-20240620" api_key_env_var: "ANTHROPIC_API_KEY"
 
-  test_writer:
-    provider: "openai"
-    model: "gpt-4o"
-    temperature: 0.3
-    api_key_env_var: "OPENAI_API_KEY"
+    # Writes the pytest suite from the contract (never sees the code).
+    # WORKLOAD: heavy — needs solid coding + hypothesis fluency.
+    test_writer:
+        provider: "ollama-cloud"
+        model: "qwen3-coder:480b"
+        temperature: 0.3
+        api_key_env_var: "OLLAMA_API_KEY"
+        # Alternatives: gpt-oss:120b (ollama-cloud) | gpt-4o (openai)
 
-  contract_verifier:
-    provider: "google-genai"
-    model: "gemini-2.0-flash"
-    temperature: 0
-    api_key_env_var: "GOOGLE_API_KEY"
+    # PASS/FAIL check that tests match the contract.
+    # WORKLOAD: light — cheap, fast, deterministic.
+    contract_verifier:
+        provider: "ollama-cloud"
+        model: "gpt-oss:20b"
+        temperature: 0
+        api_key_env_var: "OLLAMA_API_KEY"
 
-  code_writer:
-    provider: "anthropic"
-    model: "claude-3-5-sonnet-20240620"
-    temperature: 0.1
-    api_key_env_var: "ANTHROPIC_API_KEY"
+    # Implements the code to pass the frozen tests.
+    # WORKLOAD: premium — heaviest coding in the pipeline.
+    code_writer:
+        provider: "ollama-cloud"
+        model: "qwen3-coder:480b"
+        temperature: 0.1
+        api_key_env_var: "OLLAMA_API_KEY"
+        # Recommended escalation for the very heaviest lifting:
+        #   provider: "anthropic"  model: "claude-3-5-sonnet-20240620"  api_key_env_var: "ANTHROPIC_API_KEY"
+        #   provider: "google-genai"  model: "gemini-2.5-pro"           api_key_env_var: "GOOGLE_API_KEY"
 
-  error_distiller:
-    provider: "ollama"
-    model: "llama3:8b"
-    temperature: 0
-    api_key_env_var: "OLLAMA_BASE_URL"
+    # Classifies failures (impl/tests/spec) and does semantic contract checks.
+    # WORKLOAD: light-to-medium — bump to gpt-oss:120b for sharper judgement.
+    error_distiller:
+        provider: "ollama-cloud"
+        model: "gpt-oss:120b"
+        temperature: 0
+        api_key_env_var: "OLLAMA_API_KEY"
 
-  archivist_node:
-    provider: "google-genai"
-    model: "gemini-2.0-flash"
-    temperature: 0
-    api_key_env_var: "GOOGLE_API_KEY"
+    # Summarizes the successful plan/contract into a ledger entry.
+    # WORKLOAD: light.
+    archivist_node:
+        provider: "ollama-cloud"
+        model: "gpt-oss:20b"
+        temperature: 0
+        api_key_env_var: "OLLAMA_API_KEY"
 
 loop_limits:
-  max_verification_loops: 10
-  max_regression_count: 4
-  max_replan_count: 3
+    max_verification_loops: 10
+    max_regression_count: 4
+    max_replan_count: 3
 
 docker:
-  image: "python:3.11-slim"
-  timeout_install: 90
-  timeout_test: 120
-  memory_limit: "512m"
+    image: "python:3.11-slim"
+    timeout_install: 90
+    timeout_test: 120
+    memory_limit: "512m"

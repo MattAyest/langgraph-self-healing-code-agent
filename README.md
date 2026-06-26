@@ -1,62 +1,150 @@
-# langgraph-self-healing-code-agent
+# Coding Module — Self-Healing Code Generation Microservice
 
-An autonomous, self-healing code generation microservice built with LangGraph and FastAPI.
+An autonomous code generation microservice built with LangGraph and FastAPI. Submit a natural language prompt and the agent architects a solution, writes tests first (TDD), generates an implementation, and iteratively verifies it inside an isolated Docker sandbox. Failures are classified by fault type and routed to the appropriate node for repair — the agent fixes itself until tests pass.
 
-Submit a natural language prompt and the agent architects a solution, generates Python source and test files, and iteratively verifies its own output inside an isolated Docker sandbox. If tests fail, the system distills the error trace and rewrites the code until all tests pass.
+## Architecture
 
-## Key Features
+```
+workspace_loader
+      │
+      ▼
+architect_node ──────────────────────────────┐
+      │                                      │
+      ▼                                      │
+test_writer ◄──────────┐                    │
+      │                │                    │
+      ▼                │                    │
+contract_verifier ─────┘ (up to 3 retries)  │
+      │                                      │
+      ▼                                      │
+code_writer ◄──────────┐                    │
+      │                │                    │
+      ▼                │                    │
+static_analyzer ───────┘                    │
+      │                                      │
+      ▼                                      │
+deterministic_verifier                      │
+      │                                      │
+      ▼                                      │
+error_distiller ──► code_writer  (impl)     │
+                ──► test_writer  (tests)     │
+                ──► architect_node (spec) ───┘
+                ──► archivist_node (success)
+                ──► FINISH (ceiling hit)
+```
 
-- **State Graph Architecture:** A LangGraph state machine coordinates specialised nodes — architect, synthesizer, static analyzer, verifier, and error distiller — each with a distinct responsibility.
-- **Self-Healing Execution Loop:** Generated code is executed in a sandboxed Docker container using `pytest`. Failures are intercepted, condensed into actionable fix instructions, and fed back into the synthesis node. Repeated regressions trigger a full architectural replan.
-- **Dual-Model LLM Routing:** Uses `gemini-2.5-pro` for heavy synthesis and architectural planning, and `gemini-2.5-flash` for fast, cheap tasks such as error diagnostics and dependency resolution.
-- **Portable Docker-in-Docker:** The verifier spawns sibling containers via the Docker socket. Host paths are resolved automatically at runtime by inspecting the container's own mounts — no machine-specific configuration required.
-- **Asynchronous API:** Tasks run in the background. Clients poll for status, current graph node, loop count, and final file output via a REST interface.
+### How it works
 
-## Architecture Flow
+1. **Architect** designs a module and writes a formal interface contract (signatures, exceptions, edge cases).
+2. **Test writer** writes a pytest suite from the contract — never sees the implementation.
+3. **Contract verifier** checks (cheaply) that the tests actually match the contract; retries up to 3 times.
+4. **Code writer** implements the code to pass the frozen tests.
+5. **Static analyzer** catches syntax errors deterministically before running Docker.
+6. **Deterministic verifier** installs deps and runs pytest inside a hardened `python:3.11-slim` sibling container (network disabled during test run).
+7. **Error distiller** classifies failures as `implementation`, `tests`, or `spec` faults and routes accordingly. On success, it does a semantic contract check to catch hardcoded outputs or loopholes.
+8. **Archivist** on success, summarises the architecture into a `.architecture.md` ledger.
 
-1. **Speculative Router:** Evaluates prompt complexity to decide whether a dedicated architectural plan is needed before synthesis begins.
-2. **Architect & Environment Node:** Produces a project blueprint and resolves Python dependencies into a `requirements.txt`.
-3. **Synthesizer:** Writes the implementation and test suite, structured as `src/` for source files and `tests/` for pytest files.
-4. **Static Analyzer:** Parses generated files with Python's `ast` module to catch syntax errors before any code is executed.
-5. **Deterministic Verifier:** Writes files to an isolated workspace, mounts it into a `python:3.11-slim` container, and runs `pytest`. Resource limits: 512 MB RAM, 1 CPU, 120 s timeout.
-6. **Error Distiller:** Condenses the failure trace into a targeted fix instruction and routes back to the synthesizer. After two consecutive regressions, the architect is forced to produce a new plan.
-7. **Archivist:** On success, summarises the winning architecture into a `.architecture.md` ledger in the workspace.
+### Per-node LLM routing
+
+Every node picks its own provider and model via `llm_config.yaml` — change models without rebuilding the image (the file is hot-mounted). The default config runs the entire pipeline on **Ollama Cloud** with a single `OLLAMA_API_KEY`.
+
+| Node | Model | Tier |
+|---|---|---|
+| architect_node | kimi-k2.7-code:cloud | premium |
+| test_writer | qwen3-coder:480b | heavy |
+| contract_verifier | gpt-oss:20b | light |
+| code_writer | qwen3-coder:480b | heavy |
+| error_distiller | gpt-oss:120b | medium |
+| archivist_node | gpt-oss:20b | light |
+
+To escalate a node to a frontier API, swap the provider/model in `llm_config.yaml` — no rebuild needed.
 
 ## Prerequisites
 
-- Docker (required — the verifier runs tests inside sibling containers)
-- A Google AI API key with access to Gemini 2.5 models
+- Docker on the host (the verifier spawns sibling containers via the Docker socket)
+- An Ollama Cloud API key (`OLLAMA_API_KEY`) — or swap any node to another provider in `llm_config.yaml`
 
 ## Getting Started
 
-1. Clone the repository:
+1. Clone the repo:
    ```bash
-   git clone https://github.com/yourusername/langgraph-self-healing-code-agent.git
-   cd langgraph-self-healing-code-agent
+   git clone <repo-url>
+   cd Coding-Module
    ```
 
-2. Add your API key to `.env`:
-   ```
-   GOOGLE_API_KEY=your_key_here
+2. Copy `.env.example` to `.env` and fill in your key:
+   ```bash
+   cp .env.example .env
+   # edit .env and set OLLAMA_API_KEY=<your key>
    ```
 
-3. Build and start the service:
+3. Build and start:
    ```bash
-   docker compose up --build
+   docker compose up --build -d
    ```
 
 ## Usage
 
-Submit a code generation request:
+**Submit a task:**
 ```bash
-curl -X POST "http://localhost:8000/task" \
-     -H "Content-Type: application/json" \
-     -d '{"prompt": "Write a Python script that calculates projectile motion and include a pytest suite."}'
+curl -X POST http://localhost:8000/task \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Write a Python module that implements an LRU cache."}'
 ```
 
-Poll for status using the returned `task_id`:
+Returns a `task_id` immediately. The pipeline runs in the background.
+
+**Poll for status:**
 ```bash
-curl -X GET "http://localhost:8000/task/<task_id>"
+curl http://localhost:8000/task/<task_id>
 ```
 
-The response tracks `current_node`, `loop_count`, and `regression_count` as the agent works. On completion, `status` becomes `completed` and `result` contains the full verified file manifest. Generated files are also written to `.workspaces/<task_id>/` on the host.
+Response includes `status`, `current_node`, `loop_count`, `regression_count`, `replan_count`, `thoughts` (one-line per-node log), and on completion `result` (the full file manifest).
+
+**Watch the thought log:**
+```bash
+curl http://localhost:8000/task/<task_id>/log
+```
+
+Plain-text one-liner per node action — good for tailing progress. Detailed diagnostic content (LLM responses, pytest output) is written to `.workspaces/<task_id>/task.log`.
+
+**Generated files on disk:**
+```
+.workspaces/<task_id>/
+├── src/           # generated implementation
+├── tests/         # generated test suite
+├── conftest.py    # hypothesis settings (max_examples=50)
+├── pytest.ini
+├── requirements.txt
+├── task.log       # full diagnostic log
+└── .architecture.md   # written on success
+```
+
+## Configuration
+
+`llm_config.yaml` controls per-node models, loop limits, and Docker sandbox settings. It is mounted read-only — changes take effect on the next task without a rebuild.
+
+```yaml
+loop_limits:
+    max_verification_loops: 10   # hard ceiling on verifier runs per task
+    max_regression_count: 4      # failures before forcing architect replan
+    max_replan_count: 3          # replans before giving up entirely
+
+docker:
+    image: "python:3.11-slim"
+    timeout_install: 90
+    timeout_test: 120
+    memory_limit: "512m"
+```
+
+Supported providers: `ollama-cloud`, `ollama` (local), `openai`, `anthropic`, `google-genai`, `openai-compatible`.
+
+## Docker sandbox hardening
+
+The test container runs with:
+- `--network none` during the test phase
+- `--cap-drop ALL`
+- `--security-opt no-new-privileges`
+- `--memory 512m` / `--memory-swap 512m`
+- `--pids-limit 64`
+- Runs as the host user UID so workspace files stay writable after the run

@@ -10,5 +10,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # Map the workspaces directory so files are accessible on the host
       - ./.workspaces:/app/.workspaces
+      # Mount config read-only so per-node model choices can change without a rebuild
+      - ./llm_config.yaml:/app/llm_config.yaml:ro
     env_file:
       - .env
