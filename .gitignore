@@ -39,3 +39,4 @@ SESSION_NOTES.md
 # OS generated files
 .DS_Store
 Thumbs.db
+.aider*
