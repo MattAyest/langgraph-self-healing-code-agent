@@ -1,0 +1,62 @@
+[
+  {
+    "id": "fibonacci",
+    "difficulty": "easy",
+    "prompt": "Write a Python module with a single function `fibonacci(n: int) -> list[int]` that returns the first n Fibonacci numbers as a list. n=0 returns [], n=1 returns [0]. Raise ValueError if n is negative."
+  },
+  {
+    "id": "stack",
+    "difficulty": "easy",
+    "prompt": "Write a Python module implementing a Stack class with methods: push(item), pop() -> item, peek() -> item, is_empty() -> bool, and size() -> int. pop() and peek() must raise IndexError on an empty stack."
+  },
+  {
+    "id": "merge_sorted",
+    "difficulty": "easy",
+    "prompt": "Write a Python module with a function `merge_sorted(a: list[int], b: list[int]) -> list[int]` that merges two sorted lists into a single sorted list in O(n+m) time. Both input lists are already sorted in ascending order."
+  },
+  {
+    "id": "calculator",
+    "difficulty": "medium",
+    "prompt": "Write a Python module with a function `calculate(expression: str) -> float` that evaluates a simple arithmetic expression string containing integers, +, -, *, / operators and parentheses. Raise ValueError on invalid expressions. Raise ZeroDivisionError on division by zero."
+  },
+  {
+    "id": "word_frequency",
+    "difficulty": "medium",
+    "prompt": "Write a Python module with a function `word_frequency(text: str) -> dict[str, int]` that returns a dict mapping each unique word to its count. Words are case-insensitive and punctuation should be stripped. Returns an empty dict for empty or whitespace-only input."
+  },
+  {
+    "id": "csv_parse",
+    "difficulty": "hard",
+    "prompt": "Write a Python module with a function `parse_csv(text: str) -> list[dict]` that parses a CSV string into a list of dicts, one per data row. The first non-empty line is the header row supplying the keys. Each cell value is type-inferred: an int if it matches an integer pattern, a float if it matches a decimal pattern, otherwise the original string. Input with no data rows returns []. Raise ValueError if any data row has a different number of fields than the header."
+  },
+  {
+    "id": "graph",
+    "difficulty": "hard",
+    "prompt": "Write a Python module implementing a directed Graph class with methods: add_edge(u, v), dfs(start) -> list, bfs(start) -> list, has_cycle() -> bool, and shortest_path(start, end) -> list. dfs and bfs return nodes in visitation order, visiting neighbors in the order their edges were added. shortest_path returns the node sequence of a path with the fewest edges, or [] if no path exists. Calling dfs, bfs, or shortest_path with a node that was never added raises KeyError."
+  },
+  {
+    "id": "evaluator",
+    "difficulty": "hard",
+    "prompt": "Write a Python module with a function `evaluate(expression: str) -> float` that evaluates an arithmetic expression supporting +, -, *, /, ** (exponentiation, right-associative), unary minus, and parentheses, all with correct operator precedence. Integer and decimal literals are allowed and whitespace is insignificant. Raise ValueError on malformed input and ZeroDivisionError on division by zero."
+  },
+  {
+    "id": "token_bucket",
+    "difficulty": "expert",
+    "prompt": "Write a Python module implementing a TokenBucket class. The constructor is TokenBucket(capacity: int, refill_rate: float, time_func=time.monotonic) where refill_rate is tokens added per second and time_func is an injectable clock for deterministic testing. The bucket starts full. Method consume(tokens: int = 1) -> bool returns True and deducts the tokens when enough are available, otherwise returns False and deducts nothing. Tokens refill continuously based on elapsed time from time_func, never exceeding capacity. Raise ValueError if capacity is not a positive int, refill_rate is not positive, or consume is called with tokens < 1."
+  },
+  {
+    "id": "min_heap",
+    "difficulty": "expert",
+    "prompt": "Write a Python module implementing a MinHeap class with methods push(item), pop() -> item (remove and return the smallest item), peek() -> item (return the smallest without removing), and __len__(). Items are compared with the < operator. pop() and peek() raise IndexError when the heap is empty. The min-heap invariant must hold after every operation, and repeated pops must yield items in non-decreasing order."
+  },
+  {
+    "id": "bounded_queue",
+    "difficulty": "expert",
+    "prompt": "Write a Python module implementing a thread-safe BoundedQueue(maxsize: int) supporting blocking put(item) and get() -> item plus qsize() -> int. put blocks the calling thread while the queue is full and get blocks while it is empty; each must wake the correct waiter as soon as space or an item becomes available. Items are returned in FIFO order. Use threading.Lock/Condition for synchronization. Raise ValueError if maxsize is not a positive int."
+  },
+  {
+    "id": "rle",
+    "difficulty": "expert",
+    "prompt": "Write a Python module with two functions: rle_encode(data: str) -> str and rle_decode(data: str) -> str. The input to rle_encode contains no digit characters. Encoding replaces each maximal run of one repeated character with that character followed by the decimal run length (a single 'a' becomes 'a1', four 'a's become 'a4'). Decoding is the exact inverse, so rle_decode(rle_encode(s)) == s for every valid s, and the empty string maps to the empty string. Raise ValueError if the input to rle_decode is not a valid encoding."
+  }
+]
