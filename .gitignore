@@ -1,4 +1,47 @@
-benchmarks/__init__.py
-benchmarks/questions.json
-benchmarks/runner.py
-benchmarks/results.jsonl   (if you want me to inspect past runs)
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Environment variables (API keys — NEVER commit)
+.env
+.env.local
+
+# LangGraph / Swarm output directories
+.workspaces/
+
+# Benchmark run output (append-only history; runner.py + questions.json ARE tracked)
+benchmarks/results.jsonl
+benchmarks/*.out
+
+# Ollama data & models
+ollama_data/
+
+# Testing and coverage
+.pytest_cache/
+.hypothesis/
+.coverage
+htmlcov/
+
+# Docker
+docker-compose.override.yml
+
+# IDE / tool config
+.claude/settings.local.json
+
+# aider working files (chat history, input history, repo-map cache)
+.aider*
+
+# Handover / internal notes (loaded into aider via .aider.conf.yml, not for the public repo)
+SESSION_NOTES.md
+HANDOVER.md
+
+# OS generated files
+.DS_Store
+Thumbs.db

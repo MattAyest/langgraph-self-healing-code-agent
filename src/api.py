@@ -12,7 +12,7 @@ from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
 
 from .graph import app as swarm_graph
-from .nodes import validate_config
+from .nodes import SERVER_TASK_DEADLINE, validate_config
 
 app = FastAPI(title="Coding Module Microservice")
 
@@ -50,16 +50,16 @@ class TaskStatusResponse(BaseModel):
     thoughts: List[str] = []
 
 
-async def run_swarm_task(task_id: str, prompt: str, workspace_dir: str):
-    initial_state = {
-        "messages": [HumanMessage(content=prompt)],
-        "workspace_dir": workspace_dir,
-    }
+async def _drive_graph(task_id: str, initial_state: Dict[str, Any]) -> Dict[str, Any]:
+    """Consume the graph stream, updating live task status as nodes run.
 
+    Returns the final file manifest. Kept separate from run_swarm_task so the
+    whole drive can be wrapped in a wall-clock deadline (asyncio.wait_for).
+    """
+    final_manifest: Dict[str, Any] = {}
+    stream = swarm_graph.astream(initial_state, stream_mode="updates")
     try:
-        # Run the graph and stream updates to capture intermediate state
-        final_manifest = {}
-        async for output in swarm_graph.astream(initial_state, stream_mode="updates"):
+        async for output in stream:
             for node_name, state_update in output.items():
                 tasks_db[task_id]["current_node"] = node_name
 
@@ -80,11 +80,50 @@ async def run_swarm_task(task_id: str, prompt: str, workspace_dir: str):
                     final_manifest = state_update["file_manifest"]
                 if "thoughts" in state_update:
                     tasks_db[task_id]["thoughts"].extend(state_update["thoughts"])
+    finally:
+        # Ensure the async generator is closed promptly on cancel/deadline so a
+        # node mid-flight doesn't keep running after we've stopped consuming.
+        await stream.aclose()
+    return final_manifest
 
-        # When done, update the task in the "database"
-        tasks_db[task_id]["status"] = "completed"
+
+async def run_swarm_task(task_id: str, prompt: str, workspace_dir: str):
+    initial_state = {
+        "messages": [HumanMessage(content=prompt)],
+        "workspace_dir": workspace_dir,
+    }
+
+    try:
+        # Wrap the whole drive in a hard wall-clock deadline. This is the
+        # server-side backstop (issue #19): if the client dies without calling
+        # /cancel, the task still can't run forever and contend with the next.
+        final_manifest = await asyncio.wait_for(
+            _drive_graph(task_id, initial_state), timeout=SERVER_TASK_DEADLINE
+        )
+
+        # The graph reaches END both on success (archivist_node → FINISH) AND on
+        # giving up (loop ceiling in deterministic_verifier, replan ceiling in
+        # error_distiller). Only the archivist is a genuine success terminal —
+        # anything else exhausted its budget with failing tests and must NOT be
+        # reported as "completed", or the runner scores a failure as PASS (#18).
         tasks_db[task_id]["result"] = final_manifest
+        if tasks_db[task_id]["current_node"] == "archivist_node":
+            tasks_db[task_id]["status"] = "completed"
+        else:
+            tasks_db[task_id]["status"] = "exhausted"
+            tasks_db[task_id]["error"] = (
+                tasks_db[task_id].get("latest_verification_error")
+                or "Terminated without passing (loop/replan ceiling reached)"
+            )
 
+    except asyncio.TimeoutError:
+        # Hit the server-side hard deadline (#19). Treated as exhaustion: it ran
+        # out of wall-clock budget, not a code crash.
+        tasks_db[task_id]["status"] = "exhausted"
+        tasks_db[task_id]["error"] = (
+            f"Server task deadline ({SERVER_TASK_DEADLINE}s) exceeded"
+        )
+        tasks_db[task_id]["result"] = None
     except asyncio.CancelledError:
         # Cancelled via /task/{id}/cancel. Cancellation lands at the next node
         # boundary (between astream yields), so the task stops promptly rather

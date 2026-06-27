@@ -109,3 +109,12 @@ docker:
     timeout_install: 90
     timeout_test: 120
     memory_limit: "512m"
+
+server:
+    # Hard wall-clock backstop per task (seconds). The orchestrator auto-cancels
+    # a task that exceeds this, even if the client never called /cancel — prevents
+    # an orphaned task (e.g. a dead benchmark runner) from running on and
+    # contending for CPU / Docker / the LLM rate limit. Keep this generous and
+    # ABOVE the client-side benchmark --timeout; it is a safety net, not the
+    # primary timeout. Expert tasks have legitimately run ~45 min.
+    task_deadline_seconds: 3600

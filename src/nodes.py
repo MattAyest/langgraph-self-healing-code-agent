@@ -160,6 +160,12 @@ LOOP_CEILING = CONFIG["loop_limits"]["max_verification_loops"]
 REGRESSION_CEILING = CONFIG["loop_limits"]["max_regression_count"]
 REPLAN_CEILING = CONFIG["loop_limits"]["max_replan_count"]
 
+# Server-side hard wall-clock deadline per task. A backstop that auto-cancels a
+# task even if the client died without cancelling it (issue #19). Independent of
+# and deliberately more generous than the client-side benchmark --timeout; this
+# only catches orphans the loop ceilings haven't already stopped.
+SERVER_TASK_DEADLINE = CONFIG.get("server", {}).get("task_deadline_seconds", 3600)
+
 
 # ---------------------------------------------------------
 # HELPER: Unified thought logger.
@@ -902,25 +908,57 @@ def deterministic_verifier(state: SwarmState):
                 ),
             }
 
-        # Extract a one-line summary from stderr for the thought log
-        stderr_lines = res.stderr.strip().splitlines()
-        fail_summary = next(
-            (l for l in stderr_lines if "FAILED" in l or "ERROR" in l or "failed" in l),
-            stderr_lines[-1] if stderr_lines else "unknown error",
+        # Extract a one-line summary for the thought log. pytest writes its
+        # result to STDOUT (not STDERR), so parse stdout: grab the final banner
+        # line ("==== N failed, M passed in 0.59s ===="), then fall back to the
+        # first FAILED/ERROR line, then stderr. (#22)
+        out_lines = res.stdout.strip().splitlines()
+        summary_line = next(
+            (
+                l.strip().strip("=").strip()
+                for l in reversed(out_lines)
+                if l.strip().startswith("=")
+                and any(w in l for w in ("passed", "failed", "error", "no tests"))
+            ),
+            "",
         )
+        first_fail = next(
+            (l.strip() for l in out_lines if l.startswith(("FAILED", "ERROR"))), ""
+        )
+        stderr_lines = res.stderr.strip().splitlines()
+        fail_summary = (
+            summary_line
+            or first_fail
+            or (stderr_lines[-1] if stderr_lines else "unknown error")
+        )
+
         _diag(
             workspace,
             "deterministic_verifier",
             f"STDOUT:\n{res.stdout}\n\nSTDERR:\n{res.stderr}",
         )
+
+        # A suite that fails to COLLECT (import error, bad hypothesis API, syntax
+        # in a test, empty suite) is a test-harness defect, not a logic fault.
+        # pytest signals this with exit code 2/5 or an "error" summary with no
+        # "failed". Tag it so error_distiller routes it straight to test_writer
+        # with no LLM classify (mirrors STATIC ANALYSIS FAILED). A MIXED run
+        # (both failed and errors) takes the normal path — real assertion
+        # failures still need classifying. (#20)
+        is_collection_error = res.returncode in (2, 5) or (
+            "error" in summary_line.lower() and "failed" not in summary_line.lower()
+        )
+        error_prefix = "TEST COLLECTION FAILED:\n" if is_collection_error else ""
+        verdict_word = "ERRORED (collection)" if is_collection_error else "FAILED"
+
         return {
-            "verification_errors": f"STDOUT:\n{res.stdout}\n\nSTDERR:\n{res.stderr}",
+            "verification_errors": f"{error_prefix}STDOUT:\n{res.stdout}\n\nSTDERR:\n{res.stderr}",
             "loop_count": loops,
             "next_node": "error_distiller" if loops < LOOP_CEILING else "FINISH",
             "thoughts": _think(
                 workspace,
                 "deterministic_verifier",
-                f"Loop {loops}: tests FAILED — {fail_summary[:100]}",
+                f"Loop {loops}: tests {verdict_word} — {fail_summary[:100]}",
             ),
         }
 
@@ -1070,6 +1108,30 @@ def error_distiller(state: SwarmState):
     # ------------------------------------------------------------------
     # MODE 2: fault classification — an error trace is present
     # ------------------------------------------------------------------
+    # A test that fails to COLLECT (import error, bad hypothesis API, syntax in
+    # the test, empty suite) is a test-harness defect — never an implementation
+    # or spec fault. Route straight to test_writer with NO LLM classify, and do
+    # NOT count it as a regression: a broken import won't be fixed by an
+    # architect replan, so it shouldn't push the task toward one. The loop
+    # ceiling still bounds it. Mirrors the STATIC ANALYSIS short-circuit. (#20)
+    if raw_error.startswith("TEST COLLECTION FAILED:"):
+        return {
+            "verification_errors": (
+                "The test suite failed to import/collect (this is NOT an assertion "
+                "failure). Fix the test harness so pytest can collect every test — "
+                "correct the imports, hypothesis API usage, and function signatures. "
+                "Do not change the implementation.\nTrace:\n" + raw_error[:400]
+            ),
+            "rollback_graveyard": graveyard,
+            "regression_count": regression_count,  # unchanged — not a regression
+            "next_node": "test_writer",
+            "thoughts": _think(
+                workspace,
+                "error_distiller",
+                "Test collection error — routing to test_writer (no LLM classify)",
+            ),
+        }
+
     graveyard.append(raw_error[-500:])
     regression_count += 1
     _diag(
