@@ -38,8 +38,9 @@ docker-compose.override.yml
 # aider working files (chat history, input history, repo-map cache)
 .aider*
 
-# Handover / internal notes (loaded into aider via .aider.conf.yml, not for the public repo)
+# Handover / internal notes (loaded into aider via .aender.conf.yml, not for the public repo)
 SESSION_NOTES.md
+SESSION_NOTES*.md
 HANDOVER.md
 
 # OS generated files

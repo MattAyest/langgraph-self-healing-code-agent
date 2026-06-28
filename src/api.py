@@ -1,4 +1,5 @@
 import asyncio
+import sys
 import uuid
 from typing import Any, Dict, List
 
@@ -91,6 +92,7 @@ async def run_swarm_task(task_id: str, prompt: str, workspace_dir: str):
     initial_state = {
         "messages": [HumanMessage(content=prompt)],
         "workspace_dir": workspace_dir,
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
     }
 
     try:

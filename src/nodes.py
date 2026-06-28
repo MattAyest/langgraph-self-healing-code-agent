@@ -275,34 +275,30 @@ def architect_node(state: SwarmState):
     prompt = state.get("messages", [])[-1].content
     feedback = state.get("verification_errors", "")
     existing_contract = state.get("interface_contract", "")
+    python_version = state.get("python_version", "3.11")
 
     system = (
         "You are the systems architect in a TDD code-generation pipeline.\n"
-        "Think like a data engineer: you care about the shape of the data, how it flows,\n"
-        "and the contract at each boundary — not the tiny implementation details.\n"
-        "You define the what and the why; the code writer handles the how.\n\n"
-        "Your contract is the sole source of truth for the test writer, who never sees\n"
-        "the original task. The code writer reads both sections to build the implementation.\n\n"
+        "Define the public contract and architectural shape; the code writer decides the implementation.\n\n"
         "Output exactly two XML sections:\n\n"
         "<plan>\n"
-        "The architectural shape that fits this problem: the kind of structure it needs\n"
-        "and any quality properties that matter for correctness or performance. Scale this\n"
-        "to the problem — a single sentence for a simple function, more depth for a system.\n"
+        "Describe the architectural shape and quality properties (correctness, performance, failure modes).\n"
+        "Keep this high-level — mention structure and invariants, not algorithms or data layouts.\n"
         "</plan>\n\n"
         "<contract>\n"
-        "A precise behavioral specification. For every public function or method, define:\n"
-        "  - The exact signature with full type hints\n"
+        "A precise behavioral specification. Define what each operation means and what guarantees hold;\n"
+        "do not prescribe the internal algorithm, data layout, or implementation steps.\n"
+        "For every public function or method, define:\n"
+        "  - Exact signature with type hints valid for Python {python_version}\n"
         "  - What it returns and what that value represents\n"
-        "  - When it raises, stated as a rule rather than a list of cases\n"
-        "  - The guarantees that define correctness, shown with a few concrete\n"
-        "    input-to-output pairs at the meaningful boundaries\n\n"
-        "State conditions as rules. A rule covers every case at once; a list always\n"
-        "misses one and invites endless extension. Show the difference:\n\n"
-        '    As a rule:  "Raises TypeError unless n is an int."\n'
-        '    As a list:  "Raises TypeError for float, str, None, and similar."\n\n'
-        "The rule is complete and closed. The list is neither. Always prefer the rule.\n"
+        "  - When it raises, stated as a closed rule (not a list of examples)\n"
+        "  - The guarantees that define correctness, with concrete boundary examples\n\n"
+        "State conditions as rules. Rules are complete; lists always miss a case.\n"
+        "Example of form (not content):\n"
+        '  Rule:  "Raises TypeError unless n is an int."\n'
+        '  List:  "Raises TypeError for float, str, None, and similar."  ← never write this\n'
         "</contract>"
-    )
+    ).format(python_version=python_version)
 
     user_prompt = prompt
     if feedback and existing_contract:
@@ -371,43 +367,30 @@ def test_writer(state: SwarmState):
 
     system = (
         "You are the test writer node in a TDD pipeline.\n"
-        "Tests are written before any implementation exists. They are the executable proof that the\n"
-        "contract holds — aim for a suite you would trust to gate PRODUCTION code.\n\n"
-        "QUALITY OVER COUNT. A test earns its place only if it catches a defect no other test would.\n"
-        "Maximize bug-catching power, not the number of tests. Do NOT write multiple enumerated\n"
-        "variants of the same rule (e.g. n=1, n=2, n=3 of one behavior) — collapse them into a single\n"
-        "property test. Redundant tests add risk (a mistyped expected value) and cost, not coverage.\n\n"
-        "Build the suite from these techniques, choosing whichever fits each part of the contract:\n"
-        "  - RULE COVERAGE: one test for each behavior, return guarantee, and raise-rule the contract\n"
-        "    states. Every rule must be exercised at least once.\n"
-        "  - PROPERTY-BASED (hypothesis): for any invariant or relation that holds across an input\n"
-        "    domain, write a property test instead of examples — it explores far more inputs and is\n"
-        "    where real reliability comes from.\n"
-        "  - BOUNDARY: the genuine edges — empty, single element, zero, maximum, precision limits, and\n"
-        "    any precedence/associativity or ordering fork the contract defines.\n"
-        "  - METAMORPHIC / ROUND-TRIP: relations that must always hold, e.g. decode(encode(x)) == x,\n"
-        "    when the contract implies one.\n\n"
-        "Derive every expected value from the contract's RULES, not by guessing. If the contract\n"
-        "states a precedence, associativity, or raise rule, compute the expected result from it.\n\n"
-        "STAY INSIDE THE CONTRACT'S VALID INPUT DOMAIN. An input the contract says must raise is NOT a\n"
-        "valid input for a success assertion — exclude it at the source of the strategy, and test\n"
-        "those inputs separately under pytest.raises.\n\n"
+        "Write tests that prove the contract holds. Never see the implementation.\n\n"
+        "QUALITY OVER COUNT. One test per rule; one property test per invariant.\n"
+        "Do not enumerate variants of the same behavior (e.g. n=1,2,3).\n\n"
+        "Build the suite from these techniques, choosing whichever fits each rule:\n"
+        "  - RULE: one test for each behavior, return guarantee, and raise-rule.\n"
+        "  - PROPERTY: hypothesis tests for invariants that hold across a domain.\n"
+        "  - BOUNDARY: empty, single, zero, maximum, precision limits, ordering forks.\n"
+        "  - METAMORPHIC / ROUND-TRIP: relations like decode(encode(x)) == x.\n\n"
+        "Derive every expected value from the contract's RULES.\n"
+        "If the contract is ambiguous, do not invent stricter behavior — test only what it explicitly states.\n"
+        "Keep generated inputs inside the contract's valid success domain; use pytest.raises for raise cases.\n\n"
         "Output each test file wrapped in an XML tag:\n"
         '<file name="tests/test_main.py">\n'
         "# file content here\n"
         "</file>\n\n"
         "RULES:\n"
-        "1. ALL test files go in a tests/ subdirectory and must be named test_*.py.\n"
+        "1. The primary test file must be named exactly tests/test_main.py.\n"
+        "   (Not tests/test_<problem>.py — the public API is always src.main.)\n"
         "2. Always include a tests/__init__.py (can be empty).\n"
-        "3. Import the implementation from src.main (the public API lives there).\n"
-        "4. When using hypothesis:\n"
-        "   - Constrain the strategy at the source rather than filtering with assume().\n"
-        "     A bounded strategy like st.integers(min_value=1) is better than st.integers() with a guard.\n"
-        "   - Generate inputs already in the required shape — sorted data via .map(sorted), for example.\n"
-        "   - Keep every generated input within the contract's valid domain.\n"
-        "   - Add @settings(max_examples=50) to every @given test.\n"
-        "5. Output raw Python inside the XML tags — no markdown code fences.\n"
-        "6. Output ONLY test files — no src/ files, no requirements.txt."
+        "3. Import the implementation from src.main.\n"
+        "4. Constrain hypothesis strategies at the source; never use assume().\n"
+        "5. Add @settings(max_examples=50) to every @given test.\n"
+        "6. Output raw Python inside the XML tags — no markdown fences.\n"
+        "7. Output ONLY test files."
     )
 
     prior_tests = {
@@ -616,29 +599,27 @@ def code_writer(state: SwarmState):
     errors = state.get("verification_errors", "")
     graveyard = state.get("rollback_graveyard", [])
     manifest = state.get("file_manifest", {})
+    python_version = state.get("python_version", "3.11")
 
     system = (
         "You are the implementation node in a TDD pipeline.\n"
-        "Your job is to correctly implement the interface contract.\n"
-        "The contract defines the expected inputs, outputs, exceptions, and edge cases — "
-        "that is what you are writing to.\n"
-        "A test suite will verify your implementation against the contract. "
-        "Do not optimise for the tests — implement the contract correctly and the tests will pass.\n\n"
+        "Implement the interface contract correctly. Do not optimise for the tests;\n"
+        "correct behaviour makes the tests pass as a consequence.\n\n"
+        "The <plan> suggests architecture but is non-binding.\n"
+        "The <contract> is the binding specification. If they conflict, follow the contract.\n\n"
         "Output each source file wrapped in an XML tag:\n"
         '<file name="src/main.py">\n'
         "# file content here\n"
         "</file>\n\n"
         "RULES:\n"
-        "1. The public implementation lives in src/main.py. The test suite imports from src.main, "
-        "so the contract's public functions and classes must be defined or importable there.\n"
-        "2. Always include src/__init__.py. Additional helper modules may go in src/ if useful.\n"
-        '3. Always output a <file name="requirements.txt"> listing every third-party pip dependency.\n'
-        "   If no third-party packages are needed, output an empty requirements.txt.\n"
-        "4. Do NOT output any test files.\n"
-        "5. Output raw Python inside the XML tags — no markdown code fences.\n"
-        "6. Do not hardcode outputs or special-case inputs — implement the actual logic.\n"
-        "   A semantic validator checks for this and will send you back if found.\n"
-    )
+        "1. Public implementation lives in src/main.py; tests import from src.main.\n"
+        "2. Include src/__init__.py. Additional helper modules may go in src/.\n"
+        "3. Use only syntax and types available in Python {python_version}.\n"
+        '4. Always output a <file name="requirements.txt"> (empty if no third-party deps).\n'
+        "5. Do NOT output test files.\n"
+        "6. Output raw Python inside the XML tags — no markdown fences.\n"
+        "7. Do not hardcode outputs or special-case inputs — implement the actual logic."
+    ).format(python_version=python_version)
 
     prior_src = {
         k: v
@@ -1108,29 +1089,13 @@ def error_distiller(state: SwarmState):
     # ------------------------------------------------------------------
     # MODE 2: fault classification — an error trace is present
     # ------------------------------------------------------------------
-    # A test that fails to COLLECT (import error, bad hypothesis API, syntax in
-    # the test, empty suite) is a test-harness defect — never an implementation
-    # or spec fault. Route straight to test_writer with NO LLM classify, and do
-    # NOT count it as a regression: a broken import won't be fixed by an
-    # architect replan, so it shouldn't push the task toward one. The loop
-    # ceiling still bounds it. Mirrors the STATIC ANALYSIS short-circuit. (#20)
-    if raw_error.startswith("TEST COLLECTION FAILED:"):
-        return {
-            "verification_errors": (
-                "The test suite failed to import/collect (this is NOT an assertion "
-                "failure). Fix the test harness so pytest can collect every test — "
-                "correct the imports, hypothesis API usage, and function signatures. "
-                "Do not change the implementation.\nTrace:\n" + raw_error[:400]
-            ),
-            "rollback_graveyard": graveyard,
-            "regression_count": regression_count,  # unchanged — not a regression
-            "next_node": "test_writer",
-            "thoughts": _think(
-                workspace,
-                "error_distiller",
-                "Test collection error — routing to test_writer (no LLM classify)",
-            ),
-        }
+    # Collection failures (pytest failing to import/load test modules) can be
+    # caused by implementation bugs just as often as by test-harness bugs,
+    # because importing the tests transitively imports the implementation.
+    # Route them through the normal classifier so the traceback determines
+    # the responsible node, rather than hard-coding them to test_writer.
+    # The only deterministic short-circuit kept is STATIC ANALYSIS FAILED,
+    # where the error source is unambiguously the implementation.
 
     graveyard.append(raw_error[-500:])
     regression_count += 1
@@ -1176,20 +1141,23 @@ def error_distiller(state: SwarmState):
     else:
         system = (
             "You are the fault classifier in a TDD pipeline.\n"
-            "A test run failed. Classify where the fault lies and write a one-sentence fix instruction.\n\n"
-            "Respond in EXACTLY this format — two lines, no other text. The FAULT line must contain\n"
-            "exactly ONE of these words and nothing else: implementation, tests, or spec.\n"
-            "FAULT: <implementation, tests, or spec>\n"
+            "A test run failed. Decide whether the fault is in the implementation, the tests,\n"
+            "or the contract, then write a one-sentence fix instruction.\n\n"
+            "Think step by step in a short REASONING paragraph. Then output exactly:\n"
+            "REASONING: <one sentence explaining which evidence in the traceback points to the fault>\n"
+            "FAULT: <exactly one of: implementation, tests, spec>\n"
             "INSTRUCTION: <one actionable sentence for the responsible node>\n\n"
-            "FAULT TYPE DEFINITIONS:\n"
-            "- implementation: code logic is wrong or incomplete; tests and contract are correct\n"
-            "  Example: tests expect sorted output but the sort step is missing from the implementation\n"
-            "- tests: tests contradict or misrepresent the interface contract\n"
-            "  Example: tests import a function name that differs from what the contract specifies\n"
-            "- spec: the contract is ambiguous, contradictory, or missing required detail\n"
-            "  Example: the contract omits the return type and the tests disagree on what it should be\n\n"
-            "Default to 'implementation' when the error is a runtime exception or assertion failure\n"
-            "with no evidence of a test or contract problem."
+            "FAULT TYPES:\n"
+            "- implementation: code logic is wrong or incomplete; contract/tests are correct.\n"
+            "- tests: tests contradict the contract or are malformed (imports, hypothesis API, syntax).\n"
+            "- spec: the contract is ambiguous, contradictory, or missing required detail.\n\n"
+            "GUIDELINES:\n"
+            "- Default to 'implementation' for runtime exceptions/assertion failures unless the\n"
+            "  traceback clearly points to a test or contract problem.\n"
+            "- For collection failures (pytest failing to load test modules), inspect the traceback.\n"
+            "  If the error originates in src/main.py or its imports, it's 'implementation'.\n"
+            "  If it originates in tests/ or from pytest/hypothesis API misuse, it's 'tests'.\n"
+            "- If the classifier output is unusable, the system defaults to 'implementation'."
         )
 
         user_prompt = f"Contract:\n{contract}\n\nFailure Trace:\n{raw_error}"
@@ -1200,8 +1168,13 @@ def error_distiller(state: SwarmState):
             res = get_llm("error_distiller").invoke(
                 [SystemMessage(content=system), HumanMessage(content=user_prompt)]
             )
-            lines = res.content.strip().splitlines()
+            verdict = res.content.strip()
+            _diag(workspace, "error_distiller", f"Raw classifier response:\n{verdict}")
+            lines = verdict.strip().splitlines()
 
+            reasoning_line = next(
+                (l for l in lines if l.upper().startswith("REASONING:")), ""
+            )
             fault_line = next(
                 (l for l in lines if l.upper().startswith("FAULT:")), ""
             )
@@ -1209,6 +1182,7 @@ def error_distiller(state: SwarmState):
                 (l for l in lines if l.upper().startswith("INSTRUCTION:")), ""
             )
 
+            reasoning = reasoning_line.split(":", 1)[1].strip() if ":" in reasoning_line else ""
             raw_fault = fault_line.split(":", 1)[1].strip().lower() if ":" in fault_line else ""
             instruction = instr_line.split(":", 1)[1].strip() if ":" in instr_line else ""
 
@@ -1232,6 +1206,8 @@ def error_distiller(state: SwarmState):
                 )
             if not instruction:
                 instruction = raw_error[:200]
+
+            _diag(workspace, "error_distiller", f"Classifier reasoning: {reasoning}")
 
             next_node = {"tests": "test_writer", "spec": "architect_node"}.get(
                 fault_type, "code_writer"
