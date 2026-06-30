@@ -14,3 +14,8 @@ services:
       - ./llm_config.yaml:/app/llm_config.yaml:ro
     env_file:
       - .env
+    environment:
+      # Pass the host user identity down so sandbox test containers can run
+      # unprivileged instead of as root. Defaults to 1000:1000.
+      - PUID=${PUID:-1000}
+      - PGID=${PGID:-1000}

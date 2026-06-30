@@ -5,27 +5,29 @@ import re
 import shutil
 import socket
 import subprocess
+import textwrap
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from functools import lru_cache
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import yaml
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from .state import SwarmState
+from .state import AgenticState
 
 
+# =============================================================================
+# Custom exceptions
+# =============================================================================
 class LLMUnavailableError(Exception):
     """Raised when an LLM call is retried up to the configured cap and still fails.
 
     This is an infrastructure fault, not a code/test/spec fault. It is surfaced
     as a terminal failure so the run is not silently scored as a code-quality
     issue and the operator sees a clear message.
-
-    Carries the usage entries from every failed attempt so diagnostics aren't
-    lost when a node fails.
     """
 
     def __init__(
@@ -43,17 +45,15 @@ class LLMUnavailableError(Exception):
             f"LLM for node '{node_name}' failed after {attempts} attempt(s): {cause}"
         )
 
-# Load configuration
+
+# =============================================================================
+# Configuration loading
+# =============================================================================
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "llm_config.yaml")
 with open(CONFIG_PATH, "r") as f:
     CONFIG = yaml.safe_load(f)
 
-# Ollama Cloud is reached over the public API host with bearer auth.
 OLLAMA_CLOUD_HOST = "https://ollama.com"
-
-# Shared httpx timeout for Ollama clients. These are per-operation bounds
-# (connect/read/write/pool); the real wall-clock cap comes from
-# _invoke_with_retry's future.result(timeout=...).
 OLLAMA_TIMEOUT = httpx.Timeout(connect=15, read=180, write=15, pool=15)
 
 SUPPORTED_PROVIDERS = (
@@ -65,17 +65,49 @@ SUPPORTED_PROVIDERS = (
     "openai-compatible",
 )
 
+SANDBOX_DEPS = (
+    "pytest",
+    "hypothesis",
+    "ruff",
+    "mypy",
+)
+# Base tools are invoked inside the test container as `python -m <tool>` using
+# PYTHONPATH=/workspace/.deps, because `pip install --target` does not put
+# console scripts on PATH.
 
-# ---------------------------------------------------------
-# LLM FACTORY
-# Builds a LangChain chat client for a single node from llm_config.yaml.
-# Providers map to suppliers; "ollama-cloud" targets the hosted Ollama
-# service (ollama.com) so most nodes can run off an Ollama Pro account,
-# while the heaviest nodes can be pointed at a premium API instead.
-#
-# Heavy provider imports are deferred until a node actually needs them so
-# that an unused/uninstalled provider never breaks startup.
-# ---------------------------------------------------------
+# Loop / ceiling constants
+MAX_SANDBOX_LOOPS = 5
+MAX_COMPLIANCE_LOOPS = 2
+
+# Server-side hard wall-clock deadline per task. A backstop that auto-cancels a
+# task even if the client died without cancelling it.
+SERVER_TASK_DEADLINE = CONFIG.get("server", {}).get("task_deadline_seconds", 3600)
+
+
+# =============================================================================
+# Host identity propagation for sandbox containers
+# =============================================================================
+def _host_identity() -> Tuple[int, int]:
+    """Return the (uid, gid) that sandbox containers should run as.
+
+    When the orchestrator itself runs inside Docker as root, `os.getuid()`
+    returns 0, so the sandbox would run as root too. Instead we read PUID/PGID
+    from the environment, which docker-compose.yml sets from the host user.
+    """
+    try:
+        uid = int(os.environ.get("PUID", os.getuid() if hasattr(os, "getuid") else 0))
+    except (TypeError, ValueError):
+        uid = 0
+    try:
+        gid = int(os.environ.get("PGID", os.getgid() if hasattr(os, "getgid") else 0))
+    except (TypeError, ValueError):
+        gid = 0
+    return uid, gid
+
+
+# =============================================================================
+# LLM factory
+# =============================================================================
 def _build_llm(node_name):
     if node_name not in CONFIG.get("nodes", {}):
         raise ValueError(f"No config entry for node '{node_name}' in llm_config.yaml")
@@ -134,8 +166,6 @@ def _build_llm(node_name):
                 "timeout": OLLAMA_TIMEOUT,
             }
         else:
-            # Local / self-hosted Ollama daemon.
-            # api_key_env_var (if any) names the base-URL env var.
             base_url = os.getenv(
                 api_key_env_var or "OLLAMA_BASE_URL", "http://localhost:11434"
             )
@@ -151,10 +181,6 @@ def _build_llm(node_name):
         )
 
     if provider == "openai-compatible":
-        # Any self-hosted server speaking the OpenAI API (vLLM, LocalAI,
-        # LM Studio, llama.cpp, text-generation-webui, ...).
-        # Requires a `base_url` in the node config; api_key is optional
-        # (many self-hosted servers ignore it — default to a placeholder).
         from langchain_openai import ChatOpenAI
 
         base_url = node_config.get("base_url")
@@ -185,97 +211,27 @@ def get_llm(node_name):
 
 def validate_config():
     """Eagerly instantiate every configured node so misconfiguration surfaces
-    at setup time rather than mid-run. Returns a list of (node, error) tuples."""
+    at setup time rather than mid-run."""
     problems = []
     for node_name in CONFIG.get("nodes", {}):
         try:
             get_llm(node_name)
-        except Exception as e:  # noqa: BLE001 - report, don't crash
+        except Exception as e:  # noqa: BLE001
             problems.append((node_name, str(e)))
     return problems
 
 
-# Load loop limits
-LOOP_CEILING = CONFIG["loop_limits"]["max_verification_loops"]
-REGRESSION_CEILING = CONFIG["loop_limits"]["max_regression_count"]
-REPLAN_CEILING = CONFIG["loop_limits"]["max_replan_count"]
-
-# Server-side hard wall-clock deadline per task. A backstop that auto-cancels a
-# task even if the client died without cancelling it (issue #19). Independent of
-# and deliberately more generous than the client-side benchmark --timeout; this
-# only catches orphans the loop ceilings haven't already stopped.
-SERVER_TASK_DEADLINE = CONFIG.get("server", {}).get("task_deadline_seconds", 3600)
-
-
-def _node_history_entry(
-    node_name: str,
-    wall_started: float,
-    wall_ended: float,
-    perf_duration: float | None = None,
-    **extras,
-) -> dict:
-    """Build a node_history record.
-
-    wall_* are Unix timestamps for absolute timing; perf_duration is the
-    high-resolution elapsed time for accurate durations.
-    """
-    return {
-        "node": node_name,
-        "started_at": datetime.fromtimestamp(wall_started, tz=timezone.utc).isoformat(),
-        "ended_at": datetime.fromtimestamp(wall_ended, tz=timezone.utc).isoformat(),
-        "duration_seconds": round(perf_duration, 3) if perf_duration is not None else round(wall_ended - wall_started, 3),
-        **extras,
-    }
-
-
-# ---------------------------------------------------------
-# HELPER: Unified thought logger.
-# Each node calls this with a short one-line summary of what it
-# did or decided. The thought is appended to the state's `thoughts`
-# list (via the Annotated reducer) AND written to task.log on disk
-# so progress is visible even without polling the API.
-# ---------------------------------------------------------
-def _think(workspace: str, node: str, message: str) -> list[str]:
-    ts = datetime.now().strftime("%H:%M:%S")
-    line = f"[{ts}] [{node}] {message}"
-    try:
-        with open(os.path.join(workspace, "task.log"), "a", encoding="utf-8") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
-    return [line]
-
-
-def _diag(workspace: str, node: str, detail: str) -> None:
-    """Write a multi-line diagnostic block to task.log only (not to state).
-    Indented under the preceding _think one-liner for readability."""
-    if not detail:
-        return
-    indented = "\n".join("  " + line for line in detail.strip().splitlines())
-    try:
-        with open(os.path.join(workspace, "task.log"), "a", encoding="utf-8") as f:
-            f.write(indented + "\n")
-    except Exception as e:
-        import sys
-        print(f"[_diag] write failed for {workspace}: {e}", file=sys.stderr)
-
-
+# =============================================================================
+# Token estimation
+# =============================================================================
 def _estimate_tokens(text: str) -> int:
-    """Rough, fast token estimate for diagnostics only.
-
-    Uses ~4 chars per token for code-like text and ~0.75 words per token for
-    English prose. Diagnostics don't need exact counts; this is cheap and
-    cross-provider.
-    """
+    """Rough, fast token estimate for diagnostics only."""
     if not text:
         return 0
-    # Blend heuristic: count whitespace-separated words plus punctuation chunks.
-    # For mostly-ASCII code this lands in the right ballpark.
     return max(1, int(len(text) / 3.5))
 
 
 def _count_message_tokens(messages) -> int:
-    """Approximate input tokens from a list of LangChain messages."""
     total = 0
     for m in messages:
         content = getattr(m, "content", "")
@@ -290,6 +246,9 @@ def _count_message_tokens(messages) -> int:
     return total
 
 
+# =============================================================================
+# LLM invocation with retry
+# =============================================================================
 def _invoke_with_retry(
     node_name: str,
     messages,
@@ -300,20 +259,12 @@ def _invoke_with_retry(
     """Call a node's LLM with a hard per-attempt timeout, retrying on transient
     errors (network drops, SSL EOF, incomplete reads, provider 5xx, slow streams).
 
-    These are infrastructure faults, not problems with the prompt or the code, so
-    retrying at the source keeps them from cascading into the fault classifier as
-    a false 'implementation' fault.
-
-    Returns a tuple of (response_content, llm_usage_entries). If all attempts
-    fail, raises LLMUnavailableError so the task fails fast with a clear message.
-    The usage entries are returned so the caller can emit them via the state
-    reducer (avoiding in-place mutation of the state list).
+    Returns (response_content, llm_usage_entries). If all attempts fail, raises
+    LLMUnavailableError so the task fails fast with a clear message.
     """
     node_config = CONFIG.get("nodes", {}).get(node_name, {})
     provider = node_config.get("provider")
     model = node_config.get("model", "unknown")
-    # Ollama's streaming endpoint is the source of incomplete-chunk hangs; force
-    # non-streaming invocations for both hosted and local Ollama.
     ollama_providers = ("ollama-cloud", "ollama")
     invoke_kwargs = {"stream": False} if provider in ollama_providers else {}
 
@@ -329,7 +280,6 @@ def _invoke_with_retry(
             def _call():
                 response = llm.invoke(messages, **invoke_kwargs)
                 content = response.content if hasattr(response, "content") else ""
-                # Capture provider metadata when available (Ollama native response).
                 metadata = getattr(response, "response_metadata", {}) or {}
                 return content, metadata
 
@@ -338,8 +288,6 @@ def _invoke_with_retry(
                 content, metadata = future.result(timeout=timeout_seconds)
 
             elapsed = time.perf_counter() - started
-            # Prefer provider-reported token counts when available; fall back to
-            # the heuristic estimate for providers that don't report them.
             output_tokens = _estimate_tokens(content)
             prompt_tokens = metadata.get("prompt_eval_count") if isinstance(metadata, dict) else None
             completion_tokens = metadata.get("eval_count") if isinstance(metadata, dict) else None
@@ -347,7 +295,6 @@ def _invoke_with_retry(
                 input_tokens = int(prompt_tokens)
             if isinstance(completion_tokens, (int, float)) and completion_tokens > 0:
                 output_tokens = int(completion_tokens)
-            # Provider duration is in nanoseconds; keep our wall-clock duration too.
             provider_duration_ns = metadata.get("total_duration") if isinstance(metadata, dict) else None
             provider_duration = (
                 round(provider_duration_ns / 1_000_000_000, 3)
@@ -424,20 +371,84 @@ def _invoke_with_retry(
                     f"LLM attempt {attempt}/{max_attempts} failed: {type(e).__name__}: {e}",
                 )
         if attempt < max_attempts:
-            # Escalating backoff: give a slow/overloaded endpoint time to recover
-            # between attempts without making fast failures wait forever.
             backoff = (2.0, 5.0, 15.0)[attempt - 1]
             time.sleep(backoff)
 
     raise LLMUnavailableError(node_name, max_attempts, last_error, usage_entries) from last_error
 
 
-# ---------------------------------------------------------
-# HELPER: Resolve host-side path for a container-internal path.
-# Docker sets the container hostname to the container ID, so we can
-# inspect our own mounts via the socket to find the host path.
-# ---------------------------------------------------------
+# =============================================================================
+# Logging helpers
+# =============================================================================
+def _think(workspace: str, node: str, message: str) -> list[str]:
+    ts = datetime.now().strftime("%H:%M:%S")
+    line = f"[{ts}] [{node}] {message}"
+    log_path = os.path.join(workspace, "task.log")
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        _chown_file_to_host(log_path)
+    except Exception:
+        pass
+    return [line]
+
+
+def _diag(workspace: str, node: str, detail: str) -> None:
+    if not detail:
+        return
+    indented = "\n".join("  " + line for line in detail.strip().splitlines())
+    log_path = os.path.join(workspace, "task.log")
+    try:
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(indented + "\n")
+        _chown_file_to_host(log_path)
+    except Exception as e:
+        import sys
+        print(f"[_diag] write failed for {workspace}: {e}", file=sys.stderr)
+
+
+# =============================================================================
+# Node history decorator
+# =============================================================================
+def _node_history_entry(
+    node_name: str,
+    wall_started: float,
+    wall_ended: float,
+    perf_duration: float | None = None,
+    **extras,
+) -> dict:
+    return {
+        "node": node_name,
+        "started_at": datetime.fromtimestamp(wall_started, tz=timezone.utc).isoformat(),
+        "ended_at": datetime.fromtimestamp(wall_ended, tz=timezone.utc).isoformat(),
+        "duration_seconds": round(perf_duration, 3) if perf_duration is not None else round(wall_ended - wall_started, 3),
+        **extras,
+    }
+
+
+def node_with_history(func):
+    def wrapper(state: AgenticState):
+        node_name = func.__name__
+        wall_started = time.time()
+        perf_started = time.perf_counter()
+        result = func(state) or {}
+        perf_ended = time.perf_counter()
+        wall_ended = time.time()
+        extras = result.pop("diagnostics", {}) if isinstance(result, dict) else {}
+        entry = _node_history_entry(
+            node_name, wall_started, wall_ended, perf_ended - perf_started, **extras
+        )
+        result["node_history"] = [entry]
+        return result
+
+    return wrapper
+
+
+# =============================================================================
+# Workspace helpers
+# =============================================================================
 def resolve_host_path(container_path: str) -> str:
+    """Resolve host-side path for a container-internal path."""
     abs_path = os.path.abspath(container_path)
     try:
         container_id = socket.gethostname()
@@ -456,1238 +467,941 @@ def resolve_host_path(container_path: str) -> str:
             ):
                 best = mount
         if best:
-            relative = abs_path[len(best["Destination"]) :]
+            relative = abs_path[len(best["Destination"]):]
             return best["Source"] + relative
     except Exception:
         pass
     return abs_path
 
 
-def node_with_history(func):
-    """Decorator that records node entry/exit timing and node-specific extras.
+def setup_workspace(workspace: str) -> None:
+    """Write the deterministic sandbox scaffolding for a task.
 
-    The wrapped function may return a dict containing a 'diagnostics' key;
-    that key is merged into the node_history entry and removed from the state
-    update so LangGraph never sees it. The node_history entry is returned via
-    the state reducer so it accumulates across the graph run.
+    These files are written once per workspace and then left alone so that
+    retry loops (test_architect or coder failures) do not wipe third-party
+    dependencies added by the coder node.
+
+    The workspace is chowned to the host user identity so that sandbox
+    containers running as that user can write into it without running as root.
     """
-
-    def wrapper(state: SwarmState):
-        node_name = func.__name__
-        wall_started = time.time()
-        perf_started = time.perf_counter()
-        result = func(state) or {}
-        perf_ended = time.perf_counter()
-        wall_ended = time.time()
-        extras = result.pop("diagnostics", {}) if isinstance(result, dict) else {}
-        entry = _node_history_entry(
-            node_name, wall_started, wall_ended, perf_ended - perf_started, **extras
-        )
-        result["node_history"] = [entry]
-        return result
-
-    return wrapper
-
-
-# ---------------------------------------------------------
-# NODE: WORKSPACE LOADER
-# ---------------------------------------------------------
-@node_with_history
-def workspace_loader(state: SwarmState):
-    workspace = state.get("workspace_dir", ".workspaces/default")
     os.makedirs(workspace, exist_ok=True)
-    return {
-        "next_node": "architect_node",
-        "thoughts": _think(
-            workspace, "workspace_loader", f"Workspace ready at {workspace}"
-        ),
-    }
 
+    conftest = textwrap.dedent(
+        """\
+        from hypothesis import HealthCheck, settings
 
-# ---------------------------------------------------------
-# NODE: ARCHITECT
-# Always runs. Produces two outputs stored separately in state:
-#   <plan>     — architectural shape + quality properties for the code writer
-#   <contract> — precise behavioral spec for the test writer (signatures,
-#                returns, raise-rules, correctness guarantees)
-# On retry from error_distiller (fault=spec), receives prior context
-# and revises the contract.
-# ---------------------------------------------------------
-@node_with_history
-def architect_node(state: SwarmState):
-    prompt = state.get("messages", [])[-1].content
-    feedback = state.get("verification_errors", "")
-    existing_contract = state.get("interface_contract", "")
-    python_version = state.get("python_version", "3.11")
-
-    system = (
-        "You are the systems architect in a TDD code-generation pipeline.\n"
-        "Define the public contract and architectural shape; the code writer decides the implementation.\n\n"
-        "Output exactly two XML sections:\n\n"
-        "<plan>\n"
-        "Describe the architectural shape and quality properties (correctness, performance, failure modes).\n"
-        "Keep this high-level — mention structure and invariants, not algorithms or data layouts.\n"
-        "</plan>\n\n"
-        "<contract>\n"
-        "A precise behavioral specification. Define what each operation means and what guarantees hold;\n"
-        "do not prescribe the internal algorithm, data layout, or implementation steps.\n"
-        "For every public function or method, define:\n"
-        "  - Exact signature with type hints valid for Python {python_version}\n"
-        "  - What it returns and what that value represents\n"
-        "  - When it raises, stated as a closed rule (not a list of examples)\n"
-        "  - The guarantees that define correctness, with concrete boundary examples\n\n"
-        "State conditions as rules. Rules are complete; lists always miss a case.\n"
-        "Example of form (not content):\n"
-        '  Rule:  "Raises TypeError unless n is an int."\n'
-        '  List:  "Raises TypeError for float, str, None, and similar."  ← never write this\n'
-        "</contract>"
-    ).format(python_version=python_version)
-
-    user_prompt = prompt
-    if feedback and existing_contract:
-        user_prompt += (
-            f"\n\nPrevious contract:\n{existing_contract}"
-            f"\n\nRun failed with spec fault — revise the contract:\n{feedback}"
+        settings.register_profile(
+            "sandbox",
+            max_examples=50,
+            deadline=5000,
+            suppress_health_check=[HealthCheck.too_slow],
         )
-
-    content, llm_usage = _invoke_with_retry(
-        "architect_node",
-        [SystemMessage(content=system), HumanMessage(content=user_prompt)],
-        state.get("workspace_dir", ""),
+        settings.load_profile("sandbox")
+        """
     )
-
-    plan_match = re.search(
-        r"<plan>(.*?)</plan>", content, re.DOTALL | re.IGNORECASE
-    )
-    contract_match = re.search(
-        r"<contract>(.*?)</contract>", content, re.DOTALL | re.IGNORECASE
-    )
-
-    plan = plan_match.group(1).strip() if plan_match else content
-    contract = contract_match.group(1).strip() if contract_match else content
-
-    is_replan = bool(feedback and existing_contract)
-    ws = state.get("workspace_dir", "")
-    thought = (
-        f"Replanning — {feedback[:80]}"
-        if is_replan
-        else f"Designed plan ({len(plan)} chars), contract ({len(contract)} chars)"
-    )
-    _diag(ws, "architect_node", f"PLAN:\n{plan}\n\nCONTRACT:\n{contract}")
-
-    return {
-        "architectural_plan": plan,
-        "interface_contract": contract,
-        "contract_check_count": 0,
-        # A new contract starts a fresh implementation cycle: drop the now-obsolete
-        # tests/code so the writers regenerate against the new spec (rather than
-        # minimally patching artifacts built for the old one), and clear the stale
-        # error that triggered the replan. The graveyard is intentionally kept so
-        # failed approaches are still carried forward as "avoid" guidance.
-        "file_manifest": {},
-        "verification_errors": "",
-        "llm_usage": llm_usage,
-        "next_node": "test_writer",
-        "thoughts": _think(ws, "architect_node", thought),
-    }
-
-
-# ---------------------------------------------------------
-# NODE: TEST WRITER
-# Receives ONLY the interface contract — never sees the implementation.
-# Tests are written as a spec, not a mirror of the code.
-# On retry from error_distiller (fault=tests), receives the prior
-# verification error as context to revise specific tests.
-# ---------------------------------------------------------
-@node_with_history
-def test_writer(state: SwarmState):
-    contract = state.get("interface_contract", "")
-    errors = state.get("verification_errors", "")
-    manifest = state.get("file_manifest", {})
-
-    system = (
-        "You are the test writer node in a TDD pipeline.\n"
-        "Write tests that prove the contract holds. Never see the implementation.\n\n"
-        "QUALITY OVER COUNT. One test per rule; one property test per invariant.\n"
-        "Do not enumerate variants of the same behavior (e.g. n=1,2,3).\n\n"
-        "Build the suite from these techniques, choosing whichever fits each rule:\n"
-        "  - RULE: one test for each behavior, return guarantee, and raise-rule.\n"
-        "  - PROPERTY: hypothesis tests for invariants that hold across a domain.\n"
-        "  - BOUNDARY: empty, single, zero, maximum, precision limits, ordering forks.\n"
-        "  - METAMORPHIC / ROUND-TRIP: relations like decode(encode(x)) == x.\n\n"
-        "Derive every expected value from the contract's RULES.\n"
-        "If the contract is ambiguous, do not invent stricter behavior — test only what it explicitly states.\n"
-        "Keep generated inputs inside the contract's valid success domain; use pytest.raises for raise cases.\n\n"
-        "Output each test file wrapped in an XML tag:\n"
-        '<file name="tests/test_main.py">\n'
-        "# file content here\n"
-        "</file>\n\n"
-        "RULES:\n"
-        "1. The primary test file must be named exactly tests/test_main.py.\n"
-        "   (Not tests/test_<problem>.py — the public API is always src.main.)\n"
-        "2. Always include a tests/__init__.py (can be empty).\n"
-        "3. Import the implementation from src.main.\n"
-        "4. Constrain hypothesis strategies at the source; never use assume().\n"
-        "5. Add @settings(max_examples=50) to every @given test.\n"
-        "6. Output raw Python inside the XML tags — no markdown fences.\n"
-        "7. Output ONLY test files.\n\n"
-        "HYPOTHESIS COMPOSITE STRATEGIES:\n"
-        "If you generate recursive structured data (e.g., arithmetic expressions, trees, nested formats),\n"
-        "each recursive helper MUST be its own @st.composite strategy and MUST be called with draw(...).\n"
-        "Never pass a plain str/list to draw(); only pass hypothesis Strategy objects.\n"
-        "Correct recursive pattern (note nested @st.composite and draw(...) on every recursive call):\n"
-        "  @st.composite\n"
-        "  def expressions(draw, max_depth=4):\n"
-        "      number = st.integers(min_value=1, max_value=99).map(str)\n"
-        "      @st.composite\n"
-        "      def factor(draw, depth):\n"
-        "          if depth <= 0: return draw(number)\n"
-        "          choice = draw(st.integers(0, 2))\n"
-        "          if choice == 0: return draw(number)\n"
-        "          if choice == 1:\n"
-        "              inner = draw(expr(depth - 1))\n"
-        "              return f'({inner})'\n"
-        "          op = draw(st.sampled_from('+-'))\n"
-        "          inner = draw(factor(depth - 1))\n"
-        "          return f'{op}{inner}'\n"
-        "      @st.composite\n"
-        "      def term(draw, depth):\n"
-        "          left = draw(factor(depth))\n"
-        "          n = draw(st.integers(0, 2))\n"
-        "          parts = [left]\n"
-        "          for _ in range(n):\n"
-        "              op = draw(st.sampled_from('*/'))\n"
-        "              parts.append(op)\n"
-        "              parts.append(draw(factor(depth)))\n"
-        "          return ''.join(parts)\n"
-        "      @st.composite\n"
-        "      def expr(draw, depth):\n"
-        "          left = draw(term(depth))\n"
-        "          n = draw(st.integers(0, 2))\n"
-        "          parts = [left]\n"
-        "          for _ in range(n):\n"
-        "              op = draw(st.sampled_from('+-'))\n"
-        "              parts.append(op)\n"
-        "              parts.append(draw(term(depth)))\n"
-        "          return ''.join(parts)\n"
-        "      return draw(expr(max_depth))\n"
-    )
-
-    prior_tests = {
-        k: v
-        for k, v in manifest.items()
-        if k.startswith("tests/") and k.endswith(".py")
-    }
-
-    user_prompt = f"Interface Contract:\n{contract}"
-    if errors and prior_tests:
-        # Revise the existing suite — do NOT regenerate from scratch. Rewriting
-        # drops tests that were already correct and makes the suite churn.
-        current_tests = "\n\n".join(
-            f'<file name="{fname}">\n{code}\n</file>'
-            for fname, code in prior_tests.items()
-        )
-        user_prompt += (
-            f"\n\nYour current test suite:\n{current_tests}"
-            f"\n\nIt was flagged with:\n{errors}"
-            f"\n\nMake the MINIMAL change needed to fix the flagged test(s). Keep every other "
-            f"test exactly as it is — do not drop, rename, or rewrite tests that already match "
-            f"the contract. Output the complete revised file(s)."
-        )
-    elif errors:
-        user_prompt += (
-            f"\n\nPrevious failures — revise tests to match the contract:\n{errors}"
-        )
-
-    try:
-        content, llm_usage = _invoke_with_retry(
-            "test_writer",
-            [SystemMessage(content=system), HumanMessage(content=user_prompt)],
-            state.get("workspace_dir", ""),
-        )
-
-        test_files = {}
-        matches = re.finditer(
-            r'<file name=[\'"](.*?)[\'"]>\s*(.*?)\s*</file>',
-            content,
-            re.DOTALL | re.IGNORECASE,
-        )
-        for match in matches:
-            code = match.group(2).strip()
-            code = re.sub(r"^```[a-zA-Z]*\n?", "", code).rstrip("`").strip()
-            filename = match.group(1).strip()
-            if filename.startswith("tests/"):
-                test_files[filename] = code
-
-        if not test_files:
-            raise ValueError("No test files generated.")
-
-        ws = state.get("workspace_dir", "")
-        test_summary = "\n".join(
-            f"  {fname} ({len(code)} chars, {code.count('def test_')} tests)"
-            for fname, code in test_files.items()
-        )
-        _diag(ws, "test_writer", f"Test files:\n{test_summary}")
-
-        # Preserve any existing src/ files; replace all test files with new ones
-        src_files = {
-            k: v
-            for k, v in manifest.items()
-            if k.startswith("src/") or k == "requirements.txt"
-        }
-        return {
-            "file_manifest": {**src_files, **test_files},
-            "llm_usage": llm_usage,
-            "next_node": "contract_verifier",
-            "thoughts": _think(
-                ws,
-                "test_writer",
-                f"Wrote {len(test_files)} test files"
-                + (f" — revised: {errors[:80]}" if errors else ""),
-            ),
-        }
-
-    except Exception as e:
-        # LLM outages must fail fast, not be misclassified as test bugs.
-        if isinstance(e, LLMUnavailableError):
-            raise
-        return {
-            "verification_errors": f"Test Writer Error: {str(e)}",
-            "llm_usage": llm_usage if 'llm_usage' in locals() else [],
-            "next_node": "error_distiller",
-            "thoughts": _think(
-                state.get("workspace_dir", ""), "test_writer", f"ERROR: {str(e)[:100]}"
-            ),
-        }
-
-
-# ---------------------------------------------------------
-# NODE: CONTRACT VERIFIER
-# Lightweight flash-model check: do the generated tests correctly and
-# completely reflect the interface contract? Runs before any code is
-# written so bad tests are caught cheaply.
-# Loop-guarded: after 3 failed checks it proceeds anyway to avoid
-# an infinite test_writer loop.
-# ---------------------------------------------------------
-@node_with_history
-def contract_verifier(state: SwarmState):
-    contract = state.get("interface_contract", "")
-    manifest = state.get("file_manifest", {})
-    check_count = state.get("contract_check_count", 0) + 1
-
-    # If an implementation already exists, this is a re-verification after a
-    # tests-only revision: re-run the EXISTING code against the new tests instead
-    # of regenerating it (regeneration discards a working solution and regresses).
-    # Only the first pass, with no code yet, needs the implementation written.
-    proceed_node = "static_analyzer" if "src/main.py" in manifest else "code_writer"
-
-    test_context = "\n\n".join(
-        f"# {filename}\n{code}"
-        for filename, code in manifest.items()
-        if filename.startswith("tests/") and filename.endswith(".py")
-    )
-
-    system = (
-        "You are the contract compliance checker in a TDD pipeline.\n"
-        "Tests were written from an interface contract before any implementation existed.\n"
-        "Your job: confirm the tests faithfully reflect what the contract states.\n\n"
-        "Check these things:\n"
-        "  - Do any tests contradict the contract — wrong signature, wrong return, "
-        "an exception the contract does not specify, or behavior the contract does not define?\n"
-        "  - Does any assertion expect a value that contradicts the contract's stated rules or "
-        "guarantees? Derive the correct expected value from the rules (precedence, associativity, "
-        "raise-rules) and flag any assertion that disagrees.\n"
-        "  - Does any hypothesis strategy generate inputs outside the contract's valid input "
-        "domain and then assert success? An input the contract says must raise is not a valid "
-        "input for a success assertion — the strategy must exclude it at the source.\n"
-        "  - Does any behavior, return guarantee, or raise-rule the contract explicitly states "
-        "go untested?\n\n"
-        "Judge against what the contract actually says. Do not require tests for inputs or cases "
-        "the contract does not mention — absence from the contract is not a gap.\n\n"
-        "If the tests faithfully reflect the contract, respond with exactly:\n"
-        "PASS\n\n"
-        "Otherwise list each real issue, one sentence per line:\n"
-        "FAIL: <contradiction or untested contract requirement>\n"
-        "FAIL: <contradiction or untested contract requirement>"
-    )
-
-    user_prompt = f"Contract:\n{contract}\n\nTest Suite:\n{test_context}"
-
-    ws = state.get("workspace_dir", "")
-    verdict, llm_usage = _invoke_with_retry(
-        "contract_verifier",
-        [SystemMessage(content=system), HumanMessage(content=user_prompt)],
-        ws,
-    )
-    verdict = verdict.strip()
-    _diag(ws, "contract_verifier", f"Verdict (attempt {check_count}/3):\n{verdict}")
-
-    if verdict.upper().startswith("PASS"):
-        return {
-            "contract_check_count": check_count,
-            "verification_errors": "",
-            "llm_usage": llm_usage,
-            "next_node": proceed_node,
-            "thoughts": _think(
-                ws,
-                "contract_verifier",
-                "Tests match contract — PASS"
-                + (" (re-verifying existing code)" if proceed_node == "static_analyzer" else ""),
-            ),
-        }
-
-    # Tests don't match the contract
-    if check_count >= 3:
-        # Force proceed after 3 attempts rather than loop forever
-        return {
-            "contract_check_count": check_count,
-            "verification_errors": "",
-            "llm_usage": llm_usage,
-            "next_node": proceed_node,
-            "thoughts": _think(
-                ws,
-                "contract_verifier",
-                f"Tests mismatch (attempt {check_count}/3) — forcing proceed",
-            ),
-        }
-
-    return {
-        "contract_check_count": check_count,
-        "verification_errors": verdict,
-        "llm_usage": llm_usage,
-        "next_node": "test_writer",
-        "thoughts": _think(
-            ws,
-            "contract_verifier",
-            f"Tests mismatch (attempt {check_count}/3) — {verdict[:80]}",
-        ),
-    }
-
-
-# ---------------------------------------------------------
-# NODE: CODE WRITER
-# TDD mode: receives the architectural plan AND the pre-written tests.
-# Writes only src/ files and requirements.txt — never test files.
-# On retry the tests are frozen; only the implementation changes.
-# ---------------------------------------------------------
-@node_with_history
-def code_writer(state: SwarmState):
-    prompt = state.get("messages", [])[-1].content
-    plan = state.get("architectural_plan", "")
-    contract = state.get("interface_contract", "")
-    errors = state.get("verification_errors", "")
-    graveyard = state.get("rollback_graveyard", [])
-    manifest = state.get("file_manifest", {})
-    python_version = state.get("python_version", "3.11")
-
-    system = (
-        "You are the implementation node in a TDD pipeline.\n"
-        "Implement the interface contract correctly. Do not optimise for the tests;\n"
-        "correct behaviour makes the tests pass as a consequence.\n\n"
-        "The <plan> suggests architecture but is non-binding.\n"
-        "The <contract> is the binding specification. If they conflict, follow the contract.\n\n"
-        "Output each source file wrapped in an XML tag:\n"
-        '<file name="src/main.py">\n'
-        "# file content here\n"
-        "</file>\n\n"
-        "RULES:\n"
-        "1. Public implementation lives in src/main.py; tests import from src.main.\n"
-        "2. Include src/__init__.py. Additional helper modules may go in src/.\n"
-        "3. Use only syntax and types available in Python {python_version}.\n"
-        '4. Always output a <file name="requirements.txt"> (empty if no third-party deps).\n'
-        "5. Do NOT output test files.\n"
-        "6. Output raw Python inside the XML tags — no markdown fences.\n"
-        "7. Do not hardcode outputs or special-case inputs — implement the actual logic."
-    ).format(python_version=python_version)
-
-    prior_src = {
-        k: v
-        for k, v in manifest.items()
-        if k.startswith("src/") and k.endswith(".py")
-    }
-
-    user_prompt = prompt
-    if contract:
-        user_prompt += f"\n\nInterface Contract (primary spec — implement this correctly, do not find loopholes):\n{contract}"
-    if plan:
-        user_prompt += f"\n\nArchitecture Plan:\n{plan}"
-    if errors and prior_src:
-        # Revise the existing implementation — do NOT rewrite from scratch.
-        # Regenerating discards working code and regresses behavior that already
-        # passed. Give the writer its own prior source to patch minimally.
-        current_impl = "\n\n".join(
-            f'<file name="{fname}">\n{code}\n</file>'
-            for fname, code in prior_src.items()
-        )
-        user_prompt += (
-            f"\n\nYour current implementation (already passing most tests):\n{current_impl}"
-            f"\n\nIt failed with:\n{errors}"
-            f"\n\nMake the MINIMAL change needed to fix this specific failure. Preserve all "
-            f"behavior that already works — do not rewrite or restructure. Output the complete "
-            f"revised file(s)."
-        )
-    elif errors:
-        user_prompt += f"\n\nPrevious failures — fix the implementation:\n{errors}"
-    if graveyard:
-        user_prompt += "\n\nAVOID these failed approaches:\n" + "\n".join(
-            graveyard[-2:]
-        )
-
-    ws = state.get("workspace_dir", "")
-
-    content, llm_usage = _invoke_with_retry(
-        "code_writer",
-        [SystemMessage(content=system), HumanMessage(content=user_prompt)],
-        ws,
-    )
-
-    new_files = {}
-    matches = list(
-        re.finditer(
-            r'<file name=[\'"](.*?)[\'"]>\s*(.*?)\s*</file>',
-            content,
-            re.DOTALL | re.IGNORECASE,
-        )
-    )
-    for match in matches:
-        code = match.group(2).strip()
-        code = re.sub(r"^```[a-zA-Z]*\n?", "", code).rstrip("`").strip()
-        filename = match.group(1).strip()
-        if filename.startswith("src/") or filename == "requirements.txt":
-            new_files[filename] = code
-
-    if not new_files:
-        # This is a formatting/content problem, not an LLM outage — route to
-        # error_distiller so the loop can recover. Log the raw response so we
-        # can diagnose parse failures.
-        err = "Code Writer Error: Failed XML formatting."
-        _diag(
-            ws,
-            "code_writer",
-            f"XML parse debug: len(content)={len(content)}, matches={len(matches)}, "
-            f"all_filenames={[m.group(1).strip() for m in matches]}, "
-            f"raw_response:\n{content[:4000]}",
-        )
-        return {
-            "verification_errors": err,
-            "llm_usage": llm_usage,
-            "next_node": "error_distiller",
-            "thoughts": _think(ws, "code_writer", err),
-        }
-
-    file_summary = "\n".join(
-        f"  {fname} ({len(code)} chars)" for fname, code in new_files.items()
-    )
-    _diag(ws, "code_writer", f"Source files:\n{file_summary}")
-
-    # Keep the frozen tests; replace only src/ and requirements.txt
-    test_files = {k: v for k, v in manifest.items() if k.startswith("tests/")}
-    return {
-        "file_manifest": {**test_files, **new_files},
-        "llm_usage": llm_usage,
-        "next_node": "static_analyzer",
-        "thoughts": _think(
-            ws,
-            "code_writer",
-            f"Wrote {len(new_files)} source files"
-            + (f" — fixing: {errors[:80]}" if errors else ""),
-        ),
-    }
-
-
-# ---------------------------------------------------------
-# NODE: STATIC ANALYZER
-# ---------------------------------------------------------
-@node_with_history
-def static_analyzer(state: SwarmState):
-    manifest = state.get("file_manifest", {})
-    errors = []
-
-    for filename, code in manifest.items():
-        if filename.endswith(".py"):
-            try:
-                ast.parse(code)
-            except SyntaxError as e:
-                errors.append(f"SyntaxError in {filename}: {e.msg} at line {e.lineno}")
-
-    if errors:
-        ws = state.get("workspace_dir", "")
-        _diag(ws, "static_analyzer", "\n".join(errors))
-        return {
-            "verification_errors": "STATIC ANALYSIS FAILED:\n" + "\n".join(errors),
-            "next_node": "error_distiller",
-            "thoughts": _think(
-                ws,
-                "static_analyzer",
-                f"Syntax errors in {len(errors)} files",
-            ),
-        }
-
-    py_count = sum(1 for f in manifest if f.endswith(".py"))
-    return {
-        "next_node": "deterministic_verifier",
-        "thoughts": _think(
-            state.get("workspace_dir", ""),
-            "static_analyzer",
-            f"All {py_count} files parse cleanly",
-        ),
-    }
-
-
-# ---------------------------------------------------------
-# NODE: DETERMINISTIC VERIFIER
-# Two-phase hardened Docker execution:
-#   Phase 1 — install deps (network on, no user code runs)
-#   Phase 2 — run pytest (network off, user code executes)
-# ---------------------------------------------------------
-@node_with_history
-def deterministic_verifier(state: SwarmState):
-    workspace = state.get("workspace_dir", ".workspaces/default")
-    manifest = state.get("file_manifest", {})
-    loops = state.get("loop_count", 0) + 1
+    if not os.path.exists(os.path.join(workspace, "conftest.py")):
+        _write_workspace_file(workspace, "conftest.py", conftest)
 
     pytest_ini = "[pytest]\ntestpaths = tests\npythonpath = .\n"
-    with open(os.path.join(workspace, "pytest.ini"), "w") as f:
-        f.write(pytest_ini)
+    if not os.path.exists(os.path.join(workspace, "pytest.ini")):
+        _write_workspace_file(workspace, "pytest.ini", pytest_ini)
 
-    conftest = (
-        "from hypothesis import HealthCheck, settings\n"
-        "settings.register_profile(\n"
-        "    'default', max_examples=50, deadline=5000,\n"
-        "    suppress_health_check=[HealthCheck.too_slow]\n"
-        ")\n"
-        "settings.load_profile('default')\n"
-    )
-    with open(os.path.join(workspace, "conftest.py"), "w") as f:
-        f.write(conftest)
+    requirements = "\n".join(SANDBOX_DEPS) + "\n"
+    if not os.path.exists(os.path.join(workspace, "requirements.txt")):
+        _write_workspace_file(workspace, "requirements.txt", requirements)
 
-    # Clear stale src/ BEFORE writing the manifest, so orphan files from a previous
-    # loop don't persist while the fresh manifest files are written in clean.
-    src_dir = os.path.join(workspace, "src")
-    if os.path.exists(src_dir):
-        shutil.rmtree(src_dir)
+    # Ensure the host user (not root) owns the workspace and scaffolding files
+    # so the sandbox can run unprivileged. If we are already that user, chown
+    # is a harmless no-op.
+    _chown_to_host(workspace)
 
+
+def _chown_to_host(path: str) -> None:
+    """Recursively chown a path to the host user identity (PUID/PGID)."""
+    host_uid, host_gid = _host_identity()
+    if not host_uid and not host_gid:
+        return
+    try:
+        for root, dirs, files in os.walk(path):
+            for d in dirs:
+                os.chown(os.path.join(root, d), host_uid, host_gid)
+            for f in files:
+                os.chown(os.path.join(root, f), host_uid, host_gid)
+        os.chown(path, host_uid, host_gid)
+    except Exception:
+        pass
+
+
+def _chown_file_to_host(path: str) -> None:
+    """Chown a single file to the host user identity, if one is configured."""
+    host_uid, host_gid = _host_identity()
+    if not host_uid and not host_gid:
+        return
+    try:
+        os.chown(path, host_uid, host_gid)
+    except Exception:
+        pass
+
+
+def _write_workspace_file(workspace: str, filename: str, content: str) -> None:
+    filepath = os.path.join(workspace, filename)
+    os.makedirs(os.path.dirname(filepath), exist_ok=True)
+    with open(filepath, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def _clear_directory(path: str) -> None:
+    if os.path.exists(path):
+        shutil.rmtree(path)
+
+
+def write_manifest_to_disk(workspace: str, manifest: Dict[str, str]) -> None:
+    """Write the current manifest files to disk, clearing stale src/ and tests/ first."""
+    _clear_directory(os.path.join(workspace, "src"))
+    _clear_directory(os.path.join(workspace, "tests"))
     for filename, code in manifest.items():
         filepath = os.path.join(workspace, filename)
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
-        with open(filepath, "w") as f:
+        with open(filepath, "w", encoding="utf-8") as f:
             f.write(code)
+    # The orchestrator may be root; make sure the sandbox (host user) can read
+    # and write everything we just produced.
+    _chown_to_host(os.path.join(workspace, "src"))
+    _chown_to_host(os.path.join(workspace, "tests"))
 
-    # Clear stale deps so a changed requirements.txt on retry gets a clean install.
-    # Pre-create so the container user (running as host UID) can write into it.
-    deps_dir = os.path.join(workspace, ".deps")
-    if os.path.exists(deps_dir):
-        shutil.rmtree(deps_dir)
-    os.makedirs(deps_dir)
 
-    host_workspace = resolve_host_path(workspace)
+def read_file_from_disk(workspace: str, filename: str) -> str:
+    filepath = os.path.join(workspace, filename)
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+# =============================================================================
+# File manifest parsing
+# =============================================================================
+def _parse_file_tags(content: str) -> Dict[str, str]:
+    """Parse <file name="...">...</file> tags."""
+    files: Dict[str, str] = {}
+    for match in re.finditer(
+        r'<file name=[\'"](.*?)[\'"]>\s*(.*?)\s*</file>',
+        content,
+        re.DOTALL | re.IGNORECASE,
+    ):
+        code = match.group(2).strip()
+        code = re.sub(r"^```[a-zA-Z]*\n?", "", code).rstrip("`").strip()
+        filename = match.group(1).strip()
+        files[filename] = code
+    return files
+
+
+# =============================================================================
+# NODE: test_architect
+# =============================================================================
+@node_with_history
+def test_architect(state: AgenticState):
+    prompt = state["user_prompt"]
+    workspace = state.get("workspace_dir", "")
+    critique = state.get("compliance_critique", [])
+    sandbox_errors = state.get("sandbox_errors", "")
+
+    setup_workspace(workspace)
+
+    system = textwrap.dedent(
+        """\
+        You are the Test Architect in a strict TDD code-generation pipeline.
+
+        Your job is to produce TWO files from the user's natural-language prompt:
+          1. tests/test_main.py — a complete pytest + Hypothesis property-based test suite.
+          2. src/main.py — a matching skeleton that contains only class/function signatures
+             and `pass` bodies. The skeleton must use type hints and signatures that are
+             EXACTLY compatible with the assertions in tests/test_main.py.
+
+        Rules for the test suite:
+          - Use Hypothesis @given for invariants and randomized domains.
+          - Add one explicit @given for every rule/guarantee in the prompt.
+          - Constrain strategies at the source; never use assume().
+          - Use pytest.raises for raise-rule cases.
+          - Use concrete boundary tests (empty, zero, single, max) only when the prompt
+            explicitly mentions a boundary.
+          - Free-form, tautological, or vacuous assertions are prohibited.
+          - Import the implementation from src.main.
+          - Every @given test must have @settings(max_examples=50).
+          - Recursive Hypothesis strategies must use @st.composite and draw(...).
+          - Preserve sub-expression boundaries: parenthesize any fragment inserted into a larger expression.
+
+        Rules for the skeleton:
+          - Only output signatures + pass.
+          - Do not write any algorithmic logic here.
+          - The signatures and type hints must be exactly what the tests expect.
+          - Include src/__init__.py (empty) and tests/__init__.py (empty).
+
+        Output format: wrap each file in exactly:
+          <file name="src/main.py">...</file>
+          <file name="src/__init__.py">...</file>
+          <file name="tests/test_main.py">...</file>
+          <file name="tests/__init__.py">...</file>
+
+        Do not output markdown fences, commentary, or any other files.
+        """
+    )
+
+    user_prompt = f"User prompt:\n{prompt}"
+    user_prompt += (
+        "\n\nLanguage-specific guidance: If the prompt asks for an expression evaluator, "
+        "calculator, parser, or any task that evaluates arithmetic or structured strings, "
+        "generate raw expression strings and compute expected values using the target "
+        "language's standard evaluator (e.g., Python's eval() with a safe scope). Do not "
+        "hand-write AST renderers or string-composition logic that must preserve "
+        "operator precedence; let the language parser be the source of truth."
+    )
+    if critique:
+        user_prompt += (
+            "\n\nPrior compliance critiques (the previous implementation was missing these):\n"
+            + "\n".join(f"- {c}" for c in critique)
+        )
+    if sandbox_errors:
+        user_prompt += (
+            f"\n\nThe last sandbox run failed with the following errors. "
+            f"If the fault is in the tests (syntax, imports, hypothesis health check, vacuity), "
+            f"revise the tests and the matching skeleton:\n{sandbox_errors[:4000]}"
+        )
+
+    content, llm_usage = _invoke_with_retry(
+        "test_architect",
+        [SystemMessage(content=system), HumanMessage(content=user_prompt)],
+        workspace,
+    )
+
+    files = _parse_file_tags(content)
+
+    # Validate that the required files exist.
+    required = {"src/main.py", "src/__init__.py", "tests/test_main.py", "tests/__init__.py"}
+    missing = required - set(files.keys())
+    if missing:
+        _diag(
+            workspace,
+            "test_architect",
+            f"Missing required files: {missing}\nRaw response (first 2000 chars):\n{content[:2000]}",
+        )
+        return {
+            "sandbox_errors": f"Test Architect Error: missing files {sorted(missing)}",
+            "llm_usage": llm_usage,
+            "next_node": "FINISH",
+            "thoughts": _think(
+                workspace,
+                "test_architect",
+                f"ERROR: missing files {sorted(missing)}",
+            ),
+        }
+
+    _diag(
+        workspace,
+        "test_architect",
+        f"Generated files:\n"
+        + "\n".join(f"  {fname} ({len(code)} chars)" for fname, code in sorted(files.items())),
+    )
+
+    return {
+        "file_manifest": files,
+        "sandbox_errors": "",
+        "sandbox_diagnostics": {},
+        "sandbox_loop_count": 0,
+        "llm_usage": llm_usage,
+        "next_node": "coder",
+        "thoughts": _think(
+            workspace,
+            "test_architect",
+            f"Wrote {len(files)} files: {', '.join(sorted(files.keys()))}",
+        ),
+    }
+
+
+# =============================================================================
+# NODE: coder
+# =============================================================================
+@node_with_history
+def coder(state: AgenticState):
+    prompt = state["user_prompt"]
+    workspace = state.get("workspace_dir", "")
+    manifest = state.get("file_manifest", {})
+    sandbox_errors = state.get("sandbox_errors", "")
+
+    test_code = manifest.get("tests/test_main.py", "")
+    stub_code = manifest.get("src/main.py", "")
+
+    if not test_code or not stub_code:
+        return {
+            "sandbox_errors": "Coder Error: missing tests/test_main.py or src/main.py skeleton",
+            "next_node": "FINISH",
+            "thoughts": _think(
+                workspace,
+                "coder",
+                "ERROR: missing frozen test or skeleton before coding",
+            ),
+        }
+
+    system = textwrap.dedent(
+        """\
+        You are the Coder in a strict TDD pipeline.
+
+        You are given:
+          - The original user prompt.
+          - The frozen tests/test_main.py file (you may NOT modify it).
+          - The src/main.py skeleton with signatures and type hints (you may NOT change
+            any signature, class name, or function name).
+
+        Your job: replace every `pass` body in src/main.py with correct, clean algorithmic
+        logic so that tests/test_main.py passes.
+
+        Rules:
+          - Only modify function/class bodies. Do not change signatures, imports, or class structure.
+          - Do not output tests/test_main.py or any test file.
+          - Do not hardcode outputs or special-case inputs.
+          - Prefer clean, readable Python over clever one-liners.
+          - If requirements.txt is needed, include it as <file name="requirements.txt">.
+
+        Output format: wrap each file in exactly:
+          <file name="src/main.py">...</file>
+          <file name="requirements.txt">...</file>  (only if third-party deps are needed)
+
+        Do not output markdown fences, commentary, or any test files.
+        """
+    )
+
+    user_prompt = f"User prompt:\n{prompt}\n\nFrozen tests/test_main.py:\n{test_code}\n\nSkeleton src/main.py:\n{stub_code}"
+    if sandbox_errors:
+        user_prompt += (
+            f"\n\nThe last sandbox run failed with these errors. Fix the implementation, "
+            f"not the tests:\n{sandbox_errors[:4000]}"
+        )
+
+    content, llm_usage = _invoke_with_retry(
+        "coder",
+        [SystemMessage(content=system), HumanMessage(content=user_prompt)],
+        workspace,
+    )
+
+    new_files = _parse_file_tags(content)
+
+    if "src/main.py" not in new_files:
+        _diag(
+            workspace,
+            "coder",
+            f"No src/main.py in coder output\nRaw response (first 2000 chars):\n{content[:2000]}",
+        )
+        return {
+            "sandbox_errors": "Coder Error: failed to produce src/main.py",
+            "llm_usage": llm_usage,
+            "next_node": "FINISH",
+            "thoughts": _think(
+                workspace,
+                "coder",
+                "ERROR: no src/main.py produced",
+            ),
+        }
+
+    # Preserve frozen test files and init files; only overwrite src/main.py and requirements.txt.
+    preserved = {
+        k: v
+        for k, v in manifest.items()
+        if k.startswith("tests/") or k in {"src/__init__.py"}
+    }
+    final_manifest = {**preserved, "src/main.py": new_files["src/main.py"]}
+
+    # Merge any third-party requirements from the coder on top of the base sandbox deps
+    # so pytest/hypothesis/ruff/mypy are never lost on a retry.
+    base_reqs = set(SANDBOX_DEPS)
+    if "requirements.txt" in new_files:
+        extra_lines = [
+            line.strip()
+            for line in new_files["requirements.txt"].splitlines()
+            if line.strip() and line.strip() not in base_reqs
+        ]
+        final_manifest["requirements.txt"] = "\n".join(SANDBOX_DEPS + extra_lines) + "\n"
+    elif "requirements.txt" in manifest:
+        final_manifest["requirements.txt"] = manifest["requirements.txt"]
+
+    _diag(
+        workspace,
+        "coder",
+        f"Implementation updated:\n"
+        + "\n".join(f"  {fname} ({len(code)} chars)" for fname, code in sorted(final_manifest.items())),
+    )
+
+    return {
+        "file_manifest": final_manifest,
+        "sandbox_errors": "",
+        "sandbox_diagnostics": {},
+        "llm_usage": llm_usage,
+        "next_node": "sandbox_arbiter",
+        "thoughts": _think(
+            workspace,
+            "coder",
+            f"Implemented src/main.py ({len(new_files['src/main.py'])} chars)",
+        ),
+    }
+
+
+# =============================================================================
+# NODE: sandbox_arbiter
+# =============================================================================
+def _docker_run_record(
+    loop: int,
+    status: str,
+    duration: float,
+    stdout: str,
+    stderr: str,
+) -> dict:
+    return {
+        "loop": loop,
+        "status": status,
+        "duration_seconds": round(duration, 3),
+        "stdout_tail": stdout[-2000:],
+        "stderr_tail": stderr[-1000:],
+    }
+
+
+@node_with_history
+def sandbox_arbiter(state: AgenticState):
+    workspace = state.get("workspace_dir", ".workspaces/default")
+    manifest = state.get("file_manifest", {})
+    loop = state.get("sandbox_loop_count", 0) + 1
+
+    write_manifest_to_disk(workspace, manifest)
 
     docker_cfg = CONFIG.get("docker", {})
     IMAGE = docker_cfg.get("image", "python:3.11-slim")
     memory_limit = docker_cfg.get("memory_limit", "512m")
     timeout_install = docker_cfg.get("timeout_install", 90)
     timeout_test = docker_cfg.get("timeout_test", 120)
+    timeout_total = timeout_install + timeout_test + 60  # headroom for ruff/mypy/pytest
 
-    # docker run [OPTIONS] IMAGE [COMMAND] — all -e flags must come before the image name.
-    # Run as host user so files written to the volume remain owned by that user,
-    # allowing shutil.rmtree on retry without permission errors.
-    # os.getuid/os.getgid don't exist on Windows; Docker Desktop maps the
-    # container user to the host user automatically, so we skip the flag there.
+    host_uid, host_gid = _host_identity()
+
+    # Base hardening applied to both install and verification containers.
+    # The container runs as the host user, not root, so files it writes to
+    # the workspace remain owned by the host user.
     hardening_flags = [
-        "--memory",
-        memory_limit,
-        "--memory-swap",
-        memory_limit,
-        "--cpus",
-        "1.0",
-        "--pids-limit",
-        "64",
-        "--ulimit",
-        "nofile=1024:1024",
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges",
+        f"--user={host_uid}:{host_gid}",
+        f"--memory={memory_limit}",
+        f"--memory-swap={memory_limit}",
+        "--cpus=1.0",
+        "--pids-limit=64",
+        "--ulimit=nofile=1024:1024",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
         "-v",
-        f"{host_workspace}:/workspace",
+        f"{resolve_host_path(workspace)}:/workspace",
         "-w",
         "/workspace",
         "-e",
         "HOME=/tmp",
+        "-e",
+        "TMPDIR=/tmp",
+        "-e",
+        "PYTHONPYCACHEPREFIX=/tmp/pycache",
+        "-e",
+        f"SANDBOX_LOOP_COUNT={loop}",
     ]
-    if hasattr(os, "getuid"):
-        hardening_flags.insert(0, f"--user={os.getuid()}:{os.getgid()}")
 
+    # Writable tmpfs for tool caches and pip temp files. Used with --read-only
+    # on the verification container (and optionally on install).
+    tmpfs_flags = [
+        "--tmpfs", "/tmp:noexec,nosuid,size=100m",
+        "--tmpfs", "/var/tmp:noexec,nosuid,size=50m",
+    ]
+
+    install_env = [
+        "-e", "PIP_NO_CACHE_DIR=1",
+        "-e", "PIP_DISABLE_PIP_VERSION_CHECK=1",
+        "-e", "PIP_ROOT_USER_ACTION=ignore",
+        "-e", "TMPDIR=/workspace/.tmp",
+    ]
     install_script = (
-        "pip install -q --target /workspace/.deps pytest hypothesis && "
-        "if [ -f requirements.txt ]; then "
-        "pip install -q --target /workspace/.deps -r requirements.txt; "
-        "fi"
+        "mkdir -p /workspace/.tmp && "
+        "pip install -q --target /workspace/.deps -r /workspace/requirements.txt"
     )
     install_cmd = (
         ["docker", "run", "--rm"]
         + hardening_flags
-        + ["-e", "PIP_ROOT_USER_ACTION=ignore", "-e", "PIP_DISABLE_PIP_VERSION_CHECK=1"]
+        + tmpfs_flags
+        + install_env
         + [IMAGE, "bash", "-c", install_script]
     )
 
-    test_cmd = (
-        ["docker", "run", "--rm", "--network", "none"]
+    # Verification container: read-only root filesystem, no network, tmpfs for
+    # /tmp and /var/tmp. Only /workspace (the bind mount) is writable.
+    # All Python tools are invoked as `python -m` because pip's `--target` flag
+    # installs console scripts under .deps/bin, which is not on PATH.
+    verify_env = [
+        "-e", "PYTHONPATH=/workspace/.deps",
+        "-e", "RUFF_CACHE_DIR=/tmp/ruff_cache",
+        "-e", "MYPY_CACHE_DIR=/tmp/mypy_cache",
+    ]
+    arbiter_script = textwrap.dedent(
+        """\
+        set -euo pipefail
+        export PYTHONPATH=/workspace/.deps
+        export RUFF_CACHE_DIR=/tmp/ruff_cache
+        export MYPY_CACHE_DIR=/tmp/mypy_cache
+
+        echo "__RUFF_FORMAT_SRC_START__"
+        python -m ruff format src/main.py || { echo "__RUFF_FORMAT_SRC_FAILED__"; exit 1; }
+        echo "__RUFF_FORMAT_SRC_OK__"
+
+        echo "__RUFF_FORMAT_TESTS_START__"
+        python -m ruff format tests/test_main.py || { echo "__RUFF_FORMAT_TESTS_FAILED__"; exit 1; }
+        echo "__RUFF_FORMAT_TESTS_OK__"
+
+        echo "__RUFF_CHECK_SRC_START__"
+        python -m ruff check --fix src/main.py || { echo "__RUFF_CHECK_SRC_FAILED__"; exit 1; }
+        echo "__RUFF_CHECK_SRC_OK__"
+
+        echo "__RUFF_CHECK_TESTS_START__"
+        python -m ruff check --fix tests/test_main.py || { echo "__RUFF_CHECK_TESTS_FAILED__"; exit 1; }
+        echo "__RUFF_CHECK_TESTS_OK__"
+
+        echo "__TAUTOLOGY_START__"
+        python -c "
+import ast, sys
+tree = ast.parse(open('tests/test_main.py').read())
+for n in ast.walk(tree):
+    if isinstance(n, ast.Compare) and len(n.comparators) == 1:
+        if ast.dump(n.left) == ast.dump(n.comparators[0]):
+            print('__TAUTOLOGY_DETECTED__')
+            sys.exit(1)
+" || { echo "__TAUTOLOGY_FAILED__"; exit 1; }
+        echo "__TAUTOLOGY_OK__"
+
+        echo "__MYPY_START__"
+        python -m mypy --ignore-missing-imports src/main.py || { echo "__MYPY_SRC_FAILED__"; exit 1; }
+        echo "__MYPY_OK__"
+
+        echo "__PYTEST_START__"
+        python -m pytest tests/test_main.py \
+            -p no:cacheprovider \
+            --hypothesis-seed=42 \
+            --hypothesis-profile=sandbox \
+            || { echo "__PYTEST_FAILED__"; exit 1; }
+        echo "__PYTEST_OK__"
+
+        echo "__SANDBOX_PASS__"
+        """
+    )
+    arbiter_cmd = (
+        ["docker", "run", "--rm", "--network", "none", "--read-only"]
         + hardening_flags
-        + ["-e", "PYTHONPATH=/workspace/.deps"]
-        + [IMAGE, "python", "-m", "pytest", "-p", "no:cacheprovider"]
+        + tmpfs_flags
+        + verify_env
+        + [IMAGE, "bash", "-c", arbiter_script]
     )
 
-    def _docker_run_record(install_rc, install_duration, test_rc, test_duration, summary, first_fail, stdout, stderr):
-        return {
-            "loop": loops,
-            "install_returncode": install_rc,
-            "install_duration_seconds": round(install_duration, 3) if install_duration is not None else None,
-            "test_returncode": test_rc,
-            "test_duration_seconds": round(test_duration, 3) if test_duration is not None else None,
-            "pytest_summary": summary,
-            "first_failure": first_fail,
-            "stdout_tail": stdout[-2000:],
-            "stderr_tail": stderr[-1000:],
-        }
+    ws = workspace
+    _diag(ws, "sandbox_arbiter", f"Running sandbox loop {loop}/{MAX_SANDBOX_LOOPS}")
 
+    started = time.perf_counter()
     try:
+        # Phase 1: dependency install (network enabled)
         install_started = time.perf_counter()
         install_res = subprocess.run(
             install_cmd, capture_output=True, text=True, timeout=timeout_install
         )
         install_duration = time.perf_counter() - install_started
         if install_res.returncode != 0:
-            install_error = f"DEPENDENCY INSTALL FAILED:\nSTDOUT:\n{install_res.stdout}\nSTDERR:\n{install_res.stderr}"
-            _diag(workspace, "deterministic_verifier", install_error)
+            diag = (
+                f"Dependency install failed (loop {loop}):\n"
+                f"STDOUT:\n{install_res.stdout}\nSTDERR:\n{install_res.stderr}"
+            )
+            _diag(ws, "sandbox_arbiter", diag)
+            return _arbiter_failure(
+                ws,
+                loop,
+                status="infra_fault",
+                sandbox_errors=diag,
+                docker_runs=[_docker_run_record(loop, "dep_install_failed", install_duration, install_res.stdout, install_res.stderr)],
+            )
+
+        # Phase 2: arbiter run (network disabled)
+        arbiter_started = time.perf_counter()
+        arbiter_res = subprocess.run(
+            arbiter_cmd, capture_output=True, text=True, timeout=timeout_total
+        )
+        arbiter_duration = time.perf_counter() - arbiter_started
+        total_duration = time.perf_counter() - started
+
+        stdout = arbiter_res.stdout
+        stderr = arbiter_res.stderr
+        _diag(ws, "sandbox_arbiter", f"Sandbox output:\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}")
+
+        # Re-read files in case ruff mutated them.
+        new_main = read_file_from_disk(workspace, "src/main.py")
+        new_test = read_file_from_disk(workspace, "tests/test_main.py")
+        if new_main:
+            manifest["src/main.py"] = new_main
+        if new_test:
+            manifest["tests/test_main.py"] = new_test
+
+        diagnostics = _parse_sandbox_output(stdout, stderr, loop)
+
+        docker_runs = [_docker_run_record(loop, diagnostics["sandbox_status"], arbiter_duration, stdout, stderr)]
+
+        if diagnostics["sandbox_status"] == "pass":
             return {
-                "verification_errors": install_error,
-                "loop_count": loops,
-                "docker_runs": [
-                    _docker_run_record(
-                        install_res.returncode,
-                        install_duration,
-                        None,
-                        None,
-                        "dep install failed",
-                        "",
-                        install_res.stdout,
-                        install_res.stderr,
-                    )
-                ],
-                "next_node": "error_distiller" if loops < LOOP_CEILING else "FINISH",
+                "file_manifest": manifest,
+                "sandbox_errors": "",
+                "sandbox_diagnostics": diagnostics,
+                "sandbox_loop_count": loop,
+                "docker_runs": docker_runs,
+                "next_node": "prompt_compliance_checker",
                 "thoughts": _think(
-                    workspace,
-                    "deterministic_verifier",
-                    f"Loop {loops}: dep install FAILED",
+                    ws,
+                    "sandbox_arbiter",
+                    f"Loop {loop}: all sandbox checks PASS ({round(total_duration, 1)}s)",
                 ),
             }
 
-        test_started = time.perf_counter()
-        res = subprocess.run(
-            test_cmd, capture_output=True, text=True, timeout=timeout_test
-        )
-        test_duration = time.perf_counter() - test_started
+        return _route_sandbox_failure(ws, loop, diagnostics, docker_runs, manifest)
 
-        if res.returncode == 0:
-            # Tests passed — route through error_distiller for semantic contract validation before archiving
-            _diag(workspace, "deterministic_verifier", f"pytest output:\n{res.stdout}")
-            return {
-                "loop_count": loops,
-                "verification_errors": "",
-                "regression_count": 0,
-                "docker_runs": [
-                    _docker_run_record(
-                        install_res.returncode,
-                        install_duration,
-                        res.returncode,
-                        test_duration,
-                        "passed",
-                        "",
-                        res.stdout,
-                        res.stderr,
-                    )
-                ],
-                "next_node": "error_distiller",
-                "thoughts": _think(
-                    workspace, "deterministic_verifier", f"Loop {loops}: tests PASSED"
-                ),
-            }
-
-        # Extract a one-line summary for the thought log. pytest writes its
-        # result to STDOUT (not STDERR), so parse stdout: grab the final banner
-        # line ("==== N failed, M passed in 0.59s ===="), then fall back to the
-        # first FAILED/ERROR line, then stderr. (#22)
-        out_lines = res.stdout.strip().splitlines()
-        summary_line = next(
-            (
-                l.strip().strip("=").strip()
-                for l in reversed(out_lines)
-                if l.strip().startswith("=")
-                and any(w in l for w in ("passed", "failed", "error", "no tests"))
-            ),
-            "",
+    except subprocess.TimeoutExpired as e:
+        total_duration = time.perf_counter() - started
+        diag = f"Sandbox arbiter timed out after {round(total_duration, 1)}s"
+        _diag(ws, "sandbox_arbiter", diag)
+        return _arbiter_failure(
+            ws,
+            loop,
+            status="infra_fault",
+            sandbox_errors=diag + f"\n{e}",
+            docker_runs=[_docker_run_record(loop, "timeout", total_duration, "", str(e))],
         )
-        first_fail = next(
-            (l.strip() for l in out_lines if l.startswith(("FAILED", "ERROR"))), ""
-        )
-        stderr_lines = res.stderr.strip().splitlines()
-        fail_summary = (
-            summary_line
-            or first_fail
-            or (stderr_lines[-1] if stderr_lines else "unknown error")
+    except Exception as e:
+        total_duration = time.perf_counter() - started
+        diag = f"Sandbox arbiter crashed: {type(e).__name__}: {e}"
+        _diag(ws, "sandbox_arbiter", diag)
+        return _arbiter_failure(
+            ws,
+            loop,
+            status="infra_fault",
+            sandbox_errors=diag,
+            docker_runs=[_docker_run_record(loop, "crash", total_duration, "", str(e))],
         )
 
-        _diag(
-            workspace,
-            "deterministic_verifier",
-            f"STDOUT:\n{res.stdout}\n\nSTDERR:\n{res.stderr}",
-        )
 
-        # A suite that fails to COLLECT (import error, bad hypothesis API, syntax
-        # in a test, empty suite) is a test-harness defect, not a logic fault.
-        # pytest signals this with exit code 2/5 or an "error" summary with no
-        # "failed". Tag it so error_distiller routes it straight to test_writer
-        # with no LLM classify (mirrors STATIC ANALYSIS FAILED). A MIXED run
-        # (both failed and errors) takes the normal path — real assertion
-        # failures still need classifying. (#20)
-        is_collection_error = res.returncode in (2, 5) or (
-            "error" in summary_line.lower() and "failed" not in summary_line.lower()
-        )
-        error_prefix = "TEST COLLECTION FAILED:\n" if is_collection_error else ""
-        verdict_word = "ERRORED (collection)" if is_collection_error else "FAILED"
-
-        return {
-            "verification_errors": f"{error_prefix}STDOUT:\n{res.stdout}\n\nSTDERR:\n{res.stderr}",
-            "loop_count": loops,
-            "docker_runs": [
-                _docker_run_record(
-                    install_res.returncode,
-                    install_duration,
-                    res.returncode,
-                    test_duration,
-                    fail_summary,
-                    first_fail,
-                    res.stdout,
-                    res.stderr,
-                )
-            ],
-            "diagnostics": {"pytest_summary": fail_summary, "first_failure": first_fail},
-            "next_node": "error_distiller" if loops < LOOP_CEILING else "FINISH",
-            "thoughts": _think(
-                workspace,
-                "deterministic_verifier",
-                f"Loop {loops}: tests {verdict_word} — {fail_summary[:100]}",
-            ),
-        }
-
-    except subprocess.TimeoutExpired:
-        return {
-            "verification_errors": f"Execution Error: Test suite timed out ({timeout_test}s). Infinite loop or heavy fuzzing detected.",
-            "loop_count": loops,
-            "docker_runs": [
-                _docker_run_record(
-                    0,
-                    None,
-                    None,
-                    timeout_test,
-                    "timeout",
-                    "",
-                    "",
-                    f"subprocess.TimeoutExpired after {timeout_test}s",
-                )
-            ],
-            "next_node": "error_distiller" if loops < LOOP_CEILING else "FINISH",
-            "thoughts": _think(
-                workspace,
-                "deterministic_verifier",
-                f"Loop {loops}: TIMEOUT ({timeout_test}s)",
-            ),
-        }
-
-
-# ---------------------------------------------------------
-# NODE: ERROR DISTILLER
-# Dual-mode node — always sits between the verifier and the archivist.
-#
-# Mode 1 — Semantic validation (verification_errors is empty):
-#   Tests passed; now check whether the implementation actually satisfies
-#   the contract rather than merely gaming the test suite.
-#   PASS → archivist_node
-#   FAIL → code_writer with the semantic gap as the instruction
-#
-# Mode 2 — Fault classification (verification_errors is set):
-#   Classifies the failure and routes:
-#     implementation → code_writer
-#     tests          → test_writer
-#     spec           → architect_node
-#
-# Shared safety valves:
-#   regression_count >= REGRESSION_CEILING → force architect replan
-#   replan_count     >= REPLAN_CEILING     → terminate
-# ---------------------------------------------------------
-@node_with_history
-def error_distiller(state: SwarmState):
-    raw_error = state.get("verification_errors", "")
-    graveyard = list(state.get("rollback_graveyard", []))
-    regression_count = state.get("regression_count", 0)
-    replan_count = state.get("replan_count", 0)
-    contract = state.get("interface_contract", "")
-    manifest = state.get("file_manifest", {})
-    workspace = state.get("workspace_dir", "")
-
-    # ------------------------------------------------------------------
-    # MODE 1: semantic contract validation — tests passed, no error set
-    # ------------------------------------------------------------------
-    if not raw_error:
-        impl_context = "\n\n".join(
-            f"# {filename}\n{code}"
-            for filename, code in manifest.items()
-            if filename.startswith("src/") and filename.endswith(".py")
-        )
-
-        system = (
-            "You are the semantic contract validator in a TDD pipeline.\n"
-            "Review the implementation against the contract as an independent check on whether\n"
-            "it genuinely implements the specified behavior, not just whether it runs.\n\n"
-            "Look specifically for:\n"
-            "- Hardcoded outputs: returning a known value instead of computing the result\n"
-            "- Special-casing: branching on particular inputs to fake correctness\n"
-            "- Missing algorithm: satisfying assertions without implementing the real logic\n"
-            "- Missing behavior: a guarantee the contract states that the code silently skips\n\n"
-            "Respond with EXACTLY one of these two formats — no other text:\n"
-            "PASS\n"
-            "FAIL: <one sentence describing the specific violation or loophole>"
-        )
-        user_prompt = f"Contract:\n{contract}\n\nImplementation:\n{impl_context}"
-
-        verdict_raw, llm_usage = _invoke_with_retry(
-            "error_distiller",
-            [SystemMessage(content=system), HumanMessage(content=user_prompt)],
-            workspace,
-        )
-        verdict = verdict_raw.strip()
-        _diag(workspace, "error_distiller", f"Semantic verdict:\n{verdict}")
-
-        semantic_record = {
-            "mode": "semantic",
-            "verdict": verdict,
-            "fault": None,
-            "instruction": None,
-            "regression_count": regression_count,
-            "replan_count": replan_count,
-        }
-        if verdict.upper().startswith("PASS"):
-            return {
-                "verification_errors": "",
-                "llm_usage": llm_usage,
-                "classifier_history": [semantic_record],
-                "next_node": "archivist_node",
-                "thoughts": _think(
-                    workspace, "error_distiller", "Semantic validation PASS — archiving"
-                ),
-            }
-
-        # Semantic loophole found — treat as an implementation fault
-        instruction = (
-            verdict.split("FAIL:", 1)[-1].strip() if ":" in verdict else verdict
-        )
-        instruction = (
-            f"Implementation passes tests but violates contract: {instruction}"
-        )
-        graveyard.append(verdict[-500:])
-        new_regression_count = regression_count + 1
-
-        semantic_record.update({"fault": "implementation", "instruction": instruction})
-        if new_regression_count >= REGRESSION_CEILING:
-            if replan_count >= REPLAN_CEILING:
-                return {
-                    "verification_errors": f"Exhausted {REPLAN_CEILING} architect replans without success.",
-                    "rollback_graveyard": graveyard,
-                    "regression_count": new_regression_count,
-                    "replan_count": replan_count,
-                    "llm_usage": llm_usage,
-                    "classifier_history": [semantic_record],
-                    "next_node": "FINISH",
-                    "thoughts": _think(
-                        workspace,
-                        "error_distiller",
-                        f"Semantic FAIL #{new_regression_count} — exhausted {REPLAN_CEILING} replans, giving up",
-                    ),
-                }
-            return {
-                "verification_errors": "Persistent semantic failures. Architect must revise the spec.",
-                "rollback_graveyard": graveyard,
-                "regression_count": 0,
-                "replan_count": replan_count + 1,
-                "llm_usage": llm_usage,
-                "classifier_history": [semantic_record],
-                "next_node": "architect_node",
-                "thoughts": _think(
-                    workspace,
-                    "error_distiller",
-                    f"Semantic FAIL #{new_regression_count} — forcing replan {replan_count + 1}/{REPLAN_CEILING}",
-                ),
-            }
-
-        return {
-            "verification_errors": instruction,
-            "rollback_graveyard": graveyard,
-            "regression_count": new_regression_count,
-            "llm_usage": llm_usage,
-            "classifier_history": [semantic_record],
-            "next_node": "code_writer",
-            "thoughts": _think(
-                workspace,
-                "error_distiller",
-                f"Semantic FAIL #{new_regression_count} — {instruction[:80]}",
-            ),
-        }
-
-    # ------------------------------------------------------------------
-    # MODE 2: fault classification — an error trace is present
-    # ------------------------------------------------------------------
-    # Collection failures (pytest failing to import/load test modules) can be
-    # caused by implementation bugs just as often as by test-harness bugs,
-    # because importing the tests transitively imports the implementation.
-    # Route them through the normal classifier so the traceback determines
-    # the responsible node, rather than hard-coding them to test_writer.
-    # The only deterministic short-circuit kept is STATIC ANALYSIS FAILED,
-    # where the error source is unambiguously the implementation.
-
-    graveyard.append(raw_error[-500:])
-    regression_count += 1
-    _diag(
-        workspace,
-        "error_distiller",
-        f"Regression {regression_count}/{REGRESSION_CEILING}, replan {replan_count}/{REPLAN_CEILING}\n"
-        f"Error trace (last 500 chars):\n{raw_error[-500:]}",
-    )
-
-    classifier_record_base = {
-        "mode": "fault_classification",
-        "regression_count": regression_count,
-        "replan_count": replan_count,
+def _parse_sandbox_output(stdout: str, stderr: str, loop: int) -> Dict[str, Any]:
+    """Parse marker strings from the arbiter shell output into structured diagnostics."""
+    combined = stdout + "\n" + stderr
+    diagnostics = {
+        "sandbox_status": "pass",
+        "fault_location": None,
+        "raw_output": combined,
+        "ruff_format_src_failed": "__RUFF_FORMAT_SRC_FAILED__" in combined,
+        "ruff_format_tests_failed": "__RUFF_FORMAT_TESTS_FAILED__" in combined,
+        "ruff_check_src_failed": "__RUFF_CHECK_SRC_FAILED__" in combined,
+        "ruff_check_tests_failed": "__RUFF_CHECK_TESTS_FAILED__" in combined,
+        "tautology_detected": "__TAUTOLOGY_DETECTED__" in combined,
+        "tautology_failed": "__TAUTOLOGY_FAILED__" in combined,
+        "mypy_src_failed": "__MYPY_SRC_FAILED__" in combined,
+        "pytest_failed": "__PYTEST_FAILED__" in combined,
+        "sandbox_loop": loop,
     }
 
-    if regression_count >= REGRESSION_CEILING:
-        ceiling_record = {**classifier_record_base, "fault": "ceiling", "instruction": "regression/replan ceiling reached"}
-        if replan_count >= REPLAN_CEILING:
-            return {
-                "verification_errors": f"Exhausted {REPLAN_CEILING} architect replans without success.",
-                "rollback_graveyard": graveyard,
-                "regression_count": regression_count,
-                "replan_count": replan_count,
-                "classifier_history": [ceiling_record],
-                "next_node": "FINISH",
-                "thoughts": _think(
-                    workspace,
-                    "error_distiller",
-                    f"Regression #{regression_count} — exhausted {REPLAN_CEILING} replans, giving up",
-                ),
-            }
+    if "__SANDBOX_PASS__" in stdout:
+        diagnostics["sandbox_status"] = "pass"
+        return diagnostics
+
+    # Classify the failure.
+    if (
+        diagnostics["ruff_format_tests_failed"]
+        or diagnostics["ruff_check_tests_failed"]
+        or diagnostics["tautology_detected"]
+        or diagnostics["tautology_failed"]
+    ):
+        diagnostics["sandbox_status"] = "test_fault"
+        diagnostics["fault_location"] = "tests"
+    elif (
+        diagnostics["ruff_format_src_failed"]
+        or diagnostics["ruff_check_src_failed"]
+        or diagnostics["mypy_src_failed"]
+        or diagnostics["pytest_failed"]
+    ):
+        diagnostics["sandbox_status"] = "code_fault"
+        diagnostics["fault_location"] = "src"
+    else:
+        # Unknown / infra-level failure
+        diagnostics["sandbox_status"] = "infra_fault"
+        diagnostics["fault_location"] = "toolchain"
+
+    return diagnostics
+
+
+def _route_sandbox_failure(
+    workspace: str,
+    loop: int,
+    diagnostics: Dict[str, Any],
+    docker_runs: List[dict],
+    manifest: Dict[str, str],
+) -> Dict[str, Any]:
+    """Build the state update when the sandbox fails one or more checks."""
+    status = diagnostics["sandbox_status"]
+    # Log a concise snapshot of the diagnostics; full stdout/stderr is already
+    # captured in the docker_runs record and written by _diag earlier.
+    _diag(
+        workspace,
+        "sandbox_arbiter",
+        f"Sandbox failure: status={status}, "
+        + ", ".join(f"{k}={v}" for k, v in diagnostics.items() if k != "raw_output"),
+    )
+
+    if status == "test_fault":
         return {
-            "verification_errors": "Persistent failures across regressions. Architect must revise the spec.",
-            "rollback_graveyard": graveyard,
-            "regression_count": 0,
-            "replan_count": replan_count + 1,
-            "classifier_history": [ceiling_record],
-            "next_node": "architect_node",
+            "file_manifest": manifest,
+            "sandbox_errors": diagnostics.get("raw_output", ""),
+            "sandbox_diagnostics": diagnostics,
+            "sandbox_loop_count": 0,
+            "docker_runs": docker_runs,
+            "next_node": "test_architect",
             "thoughts": _think(
                 workspace,
-                "error_distiller",
-                f"Regression #{regression_count} — forcing replan {replan_count + 1}/{REPLAN_CEILING}",
+                "sandbox_arbiter",
+                f"Loop {loop}: test-side fault → test_architect",
             ),
         }
 
-    # Static syntax errors are always implementation faults — skip the LLM call
-    if raw_error.startswith("STATIC ANALYSIS FAILED:"):
-        fault_type = "syntax"
-        instruction = raw_error[:300]
-        next_node = "code_writer"
-        classifier_record = {
-            **classifier_record_base,
-            "raw_response": None,
-            "reasoning": "STATIC ANALYSIS FAILED short-circuit",
-            "fault": fault_type,
-            "instruction": instruction,
-        }
-    else:
-        system = (
-            "You are the fault classifier in a TDD pipeline.\n"
-            "A test run failed. Decide whether the fault is in the implementation, the tests,\n"
-            "or the contract, then write a one-sentence fix instruction.\n\n"
-            "Think step by step in a short REASONING paragraph. Then output exactly:\n"
-            "REASONING: <one sentence explaining which evidence in the traceback points to the fault>\n"
-            "FAULT: <exactly one of: implementation, tests, spec>\n"
-            "INSTRUCTION: <one actionable sentence for the responsible node>\n\n"
-            "FAULT TYPES:\n"
-            "- implementation: code logic is wrong or incomplete; contract/tests are correct.\n"
-            "- tests: tests contradict the contract or are malformed (imports, hypothesis API, syntax).\n"
-            "- spec: the contract is ambiguous, contradictory, or missing required detail.\n\n"
-            "GUIDELINES:\n"
-            "- Default to 'implementation' for runtime exceptions/assertion failures unless the\n"
-            "  traceback clearly points to a test or contract problem.\n"
-            "- For collection failures (pytest failing to load test modules), inspect the traceback.\n"
-            "  If the error originates in src/main.py or its imports, it's 'implementation'.\n"
-            "  If it originates in tests/ or from pytest/hypothesis API misuse, it's 'tests'.\n"
-            "- If the classifier output is unusable, the system defaults to 'implementation'."
-        )
-
-        user_prompt = f"Contract:\n{contract}\n\nFailure Trace:\n{raw_error}"
-
-        VALID_FAULTS = ("implementation", "tests", "spec")
-
-        verdict_raw, llm_usage = _invoke_with_retry(
-            "error_distiller",
-            [SystemMessage(content=system), HumanMessage(content=user_prompt)],
-            workspace,
-        )
-        verdict = verdict_raw.strip()
-        _diag(workspace, "error_distiller", f"Raw classifier response:\n{verdict}")
-        lines = verdict.strip().splitlines()
-
-        reasoning_line = next(
-            (l for l in lines if l.upper().startswith("REASONING:")), ""
-        )
-        fault_line = next(
-            (l for l in lines if l.upper().startswith("FAULT:")), ""
-        )
-        instr_line = next(
-            (l for l in lines if l.upper().startswith("INSTRUCTION:")), ""
-        )
-
-        reasoning = reasoning_line.split(":", 1)[1].strip() if ":" in reasoning_line else ""
-        raw_fault = fault_line.split(":", 1)[1].strip().lower() if ":" in fault_line else ""
-        instruction = instr_line.split(":", 1)[1].strip() if ":" in instr_line else ""
-
-        # Accept an exact match, or a value wrapped in extra words (exactly one
-        # valid word present). An echoed template ('implementation|tests|spec')
-        # names all three, so it resolves to None — fall back loudly instead of
-        # silently misrouting to the default.
-        if raw_fault in VALID_FAULTS:
-            fault_type = raw_fault
-        else:
-            present = [v for v in VALID_FAULTS if re.search(rf"\b{v}\b", raw_fault)]
-            fault_type = present[0] if len(present) == 1 else None
-
-        if fault_type is None:
-            fault_type = "implementation"
-            _diag(
-                workspace,
-                "error_distiller",
-                f"WARNING: unusable fault classification — defaulting to 'implementation'. "
-                f"Raw FAULT line: {fault_line!r}",
-            )
-        if not instruction:
-            instruction = raw_error[:200]
-
-        _diag(workspace, "error_distiller", f"Classifier reasoning: {reasoning}")
-
-        next_node = {"tests": "test_writer", "spec": "architect_node"}.get(
-            fault_type, "code_writer"
-        )
-        classifier_record = {
-            **classifier_record_base,
-            "raw_response": verdict,
-            "reasoning": reasoning,
-            "fault": fault_type,
-            "instruction": instruction,
-        }
-
-    _diag(
-        workspace,
-        "error_distiller",
-        f"Fault classification:\n"
-        f"  type: {fault_type}\n"
-        f"  route: {next_node}\n"
-        f"  regression: {regression_count}/{REGRESSION_CEILING}\n"
-        f"  replan: {replan_count}/{REPLAN_CEILING}\n"
-        f"  instruction: {instruction}",
-    )
-
-    new_replan_count = (
-        replan_count + 1 if next_node == "architect_node" else replan_count
-    )
-    if next_node == "architect_node" and replan_count >= REPLAN_CEILING:
+    if status == "infra_fault":
+        # Infra faults are not recoverable by the coder or architect. Terminate.
         return {
-            "verification_errors": f"Exhausted {REPLAN_CEILING} architect replans without success.",
-            "rollback_graveyard": graveyard,
-            "regression_count": regression_count,
-            "replan_count": new_replan_count,
-            "classifier_history": [classifier_record],
+            "file_manifest": manifest,
+            "sandbox_errors": diagnostics.get("raw_output", ""),
+            "sandbox_diagnostics": diagnostics,
+            "sandbox_loop_count": loop,
+            "docker_runs": docker_runs,
             "next_node": "FINISH",
             "thoughts": _think(
                 workspace,
-                "error_distiller",
-                f"FAULT: {fault_type} — replan ceiling hit, giving up",
+                "sandbox_arbiter",
+                f"Loop {loop}: infra fault → FINISH",
             ),
         }
 
+    # code_fault
+    if loop < MAX_SANDBOX_LOOPS:
+        return {
+            "file_manifest": manifest,
+            "sandbox_errors": diagnostics.get("raw_output", ""),
+            "sandbox_diagnostics": diagnostics,
+            "sandbox_loop_count": loop,
+            "docker_runs": docker_runs,
+            "next_node": "coder",
+            "thoughts": _think(
+                workspace,
+                "sandbox_arbiter",
+                f"Loop {loop}: code fault → coder (sandbox_loop={loop})",
+            ),
+        }
+
+    # Exhausted sandbox loops: replan from test architect.
     return {
-        "verification_errors": instruction,
-        "rollback_graveyard": graveyard,
-        "regression_count": regression_count,
-        "replan_count": new_replan_count,
-        "classifier_history": [classifier_record],
-        "diagnostics": {"fault": fault_type, "route": next_node, "mode": "fault_classification"},
-        "next_node": next_node,
+        "file_manifest": manifest,
+        "sandbox_errors": diagnostics.get("raw_output", ""),
+        "sandbox_diagnostics": diagnostics,
+        "sandbox_loop_count": 0,
+        "docker_runs": docker_runs,
+        "next_node": "test_architect",
         "thoughts": _think(
             workspace,
-            "error_distiller",
-            f"FAULT: {fault_type} → {next_node} — {instruction[:80]}",
+            "sandbox_arbiter",
+            f"Loop {loop}: sandbox loop ceiling → test_architect",
         ),
     }
 
 
-# ---------------------------------------------------------
-# NODE: ARCHIVIST
-# On success, summarises the plan and contract into a ledger entry,
-# appends it to the in-state ledger, and writes it to disk.
-# ---------------------------------------------------------
-@node_with_history
-def archivist_node(state: SwarmState):
-    workspace = state.get("workspace_dir", "")
-    plan = state.get("architectural_plan", "")
-    contract = state.get("interface_contract", "")
-    ledger = state.get("architecture_ledger", "")
-
-    if not plan and not contract:
+def _arbiter_failure(
+    workspace: str,
+    loop: int,
+    status: str,
+    sandbox_errors: str,
+    docker_runs: List[dict],
+) -> Dict[str, Any]:
+    diagnostics = {
+        "sandbox_status": status,
+        "fault_location": "toolchain",
+        "raw_output": sandbox_errors,
+        "sandbox_loop": loop,
+    }
+    if status == "infra_fault":
         return {
+            "sandbox_errors": sandbox_errors,
+            "sandbox_diagnostics": diagnostics,
+            "sandbox_loop_count": loop,
+            "docker_runs": docker_runs,
             "next_node": "FINISH",
             "thoughts": _think(
-                workspace, "archivist_node", "No plan/contract to archive"
+                workspace,
+                "sandbox_arbiter",
+                f"Loop {loop}: infra fault → FINISH",
+            ),
+        }
+    # Treat unexpected as code fault with replan.
+    return {
+        "sandbox_errors": sandbox_errors,
+        "sandbox_diagnostics": diagnostics,
+        "sandbox_loop_count": 0,
+        "docker_runs": docker_runs,
+        "next_node": "test_architect",
+        "thoughts": _think(
+            workspace,
+            "sandbox_arbiter",
+            f"Loop {loop}: unrecoverable sandbox fault → test_architect",
+        ),
+    }
+
+
+# =============================================================================
+# NODE: prompt_compliance_checker
+# =============================================================================
+@node_with_history
+def prompt_compliance_checker(state: AgenticState):
+    prompt = state["user_prompt"]
+    workspace = state.get("workspace_dir", "")
+    manifest = state.get("file_manifest", {})
+    compliance_loop = state.get("compliance_loop_count", 0)
+    prior_critique = state.get("compliance_critique", [])
+
+    src_code = manifest.get("src/main.py", "")
+    test_code = manifest.get("tests/test_main.py", "")
+
+    system = textwrap.dedent(
+        """\
+        You are the Prompt Compliance Checker in a TDD code-generation pipeline.
+
+        You are given:
+          - The original natural-language user prompt.
+          - The passing src/main.py implementation.
+          - The passing tests/test_main.py suite.
+
+        Evaluate whether src/main.py structurally satisfies the user prompt.
+        Only judge completeness against the prompt's explicit functional requirements.
+        Do NOT critique style, naming conventions, performance optimization, or code elegance.
+        Do NOT require features the prompt does not mention.
+
+        Output exactly a JSON object and nothing else:
+          {"compliance_status": "PASS" | "FAIL", "missing_features": ["..."]}
+
+        Use "PASS" only if the implementation demonstrably covers every functional
+        requirement in the prompt. Use "FAIL" if a required behavior or feature is
+        missing or incomplete; list the missing features concisely, one string per item.
+        """
+    )
+
+    user_prompt = f"User prompt:\n{prompt}\n\nsrc/main.py:\n{src_code}\n\ntests/test_main.py:\n{test_code}"
+    if prior_critique:
+        user_prompt += (
+            "\n\nPrior compliance critiques:\n"
+            + "\n".join(f"- {c}" for c in prior_critique)
+        )
+
+    content, llm_usage = _invoke_with_retry(
+        "prompt_compliance_checker",
+        [SystemMessage(content=system), HumanMessage(content=user_prompt)],
+        workspace,
+    )
+
+    # Extract JSON from the response (allow surrounding markdown fences).
+    json_match = re.search(
+        r"```(?:json)?\s*(\{.*?\})\s*```|\{.*\"compliance_status\".*\}",
+        content,
+        re.DOTALL,
+    )
+    raw_json = json_match.group(1) if json_match and json_match.group(1) else content
+    # Try to find any JSON object if the above failed.
+    if not raw_json.strip().startswith("{"):
+        obj_match = re.search(r"\{.*\}", content, re.DOTALL)
+        raw_json = obj_match.group(0) if obj_match else content
+
+    try:
+        verdict = json.loads(raw_json)
+    except Exception as e:
+        _diag(
+            workspace,
+            "prompt_compliance_checker",
+            f"Failed to parse compliance JSON. Raw content:\n{content[:2000]}\nParse error: {e}",
+        )
+        # Default to FAIL with the raw content as a critique.
+        verdict = {
+            "compliance_status": "FAIL",
+            "missing_features": [f"Compliance checker returned unparseable JSON: {str(e)[:200]}"],
+        }
+
+    status = verdict.get("compliance_status", "FAIL").upper()
+    missing = verdict.get("missing_features", []) or []
+    if not isinstance(missing, list):
+        missing = [str(missing)]
+    missing = [str(m) for m in missing if m]
+
+    _diag(
+        workspace,
+        "prompt_compliance_checker",
+        f"Compliance status: {status}\nMissing features: {missing}",
+    )
+
+    new_critique = list(prior_critique) + missing
+
+    if status == "PASS":
+        return {
+            "compliance_status": "PASS",
+            "compliance_critique": new_critique,
+            "llm_usage": llm_usage,
+            "next_node": "FINISH",
+            "thoughts": _think(
+                workspace,
+                "prompt_compliance_checker",
+                "Compliance PASS — finishing",
             ),
         }
 
-    system = (
-        "You are the archivist node in a TDD pipeline. A coding task just completed successfully.\n"
-        "Distil the contract into exactly 3 core constraints — the key invariants or non-obvious\n"
-        "decisions that would be easy to get wrong on a second pass.\n\n"
-        "Output a single markdown section in this format:\n\n"
-        "## Task: <one-line description inferred from the contract>\n"
-        "1. <constraint>\n"
-        "2. <constraint>\n"
-        "3. <constraint>\n\n"
-        "Output ONLY the markdown section — no preamble, no explanation."
-    )
-    prompt = f"Current Ledger:\n{ledger}\n\nContract:\n{contract}"
+    new_compliance_loop = compliance_loop + 1
+    if new_compliance_loop <= MAX_COMPLIANCE_LOOPS:
+        return {
+            "compliance_status": "FAIL",
+            "compliance_critique": new_critique,
+            "compliance_loop_count": new_compliance_loop,
+            "sandbox_errors": "",
+            "sandbox_diagnostics": {},
+            "sandbox_loop_count": 0,
+            "llm_usage": llm_usage,
+            "next_node": "test_architect",
+            "thoughts": _think(
+                workspace,
+                "prompt_compliance_checker",
+                f"Compliance FAIL ({new_compliance_loop}/{MAX_COMPLIANCE_LOOPS}) → test_architect: {missing}",
+            ),
+        }
 
-    res, llm_usage = _invoke_with_retry(
-        "archivist_node",
-        [SystemMessage(content=system), HumanMessage(content=prompt)],
-        workspace,
-    )
-    updated_ledger = (ledger + "\n\n" + res).strip()
-    _diag(workspace, "archivist_node", f"Ledger entry:\n{res}")
-    if workspace:
-        with open(os.path.join(workspace, ".architecture.md"), "w") as f:
-            f.write(updated_ledger)
+    # Compliance loop ceiling reached.
     return {
-        "architecture_ledger": updated_ledger,
+        "compliance_status": "FAIL",
+        "compliance_critique": new_critique,
+        "compliance_loop_count": new_compliance_loop,
         "llm_usage": llm_usage,
         "next_node": "FINISH",
         "thoughts": _think(
-            workspace, "archivist_node", "Archived plan to .architecture.md"
+            workspace,
+            "prompt_compliance_checker",
+            f"Compliance FAIL — loop ceiling reached, finishing",
         ),
     }
+
+
+# =============================================================================
+# Routing functions
+# =============================================================================
+def route_from_sandbox(state: AgenticState) -> str:
+    """Pure routing helper; kept as a function for readability and testing."""
+    return state.get("next_node", "FINISH")
+
+
+def route_from_compliance(state: AgenticState) -> str:
+    """Pure routing helper; kept as a function for readability and testing."""
+    return state.get("next_node", "FINISH")

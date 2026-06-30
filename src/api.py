@@ -1,3 +1,9 @@
+"""FastAPI layer for the v0.2 coding module.
+
+Exposes POST /task, GET /task/{id}, GET /task/{id}/log, and POST cancel.
+Tasks run as tracked asyncio tasks so they can be cancelled mid-pipeline.
+"""
+
 import asyncio
 import sys
 import uuid
@@ -9,27 +15,22 @@ load_dotenv()
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
-from langchain_core.messages import HumanMessage
 from pydantic import BaseModel
 
 from .graph import app as swarm_graph
 from .nodes import SERVER_TASK_DEADLINE, validate_config
 
-app = FastAPI(title="Coding Module Microservice")
+app = FastAPI(title="Coding Module Microservice — v0.2")
 
 # Surface misconfigured LLM nodes (missing API keys, bad provider names) at
-# startup rather than mid-task. Logs warnings but does not crash — a node
-# that fails here will still raise its own ValueError when first invoked.
+# startup rather than mid-task.
 for _node, _err in validate_config():
     print(f"[config] {_node}: {_err}")
 
 # Simple in-memory store for task status.
-# For production, you might want to use Redis or a database.
 tasks_db: Dict[str, Dict[str, Any]] = {}
 
-# Live asyncio handles for in-flight tasks, so a task can be cancelled (e.g. the
-# benchmark runner cancelling on timeout instead of leaving it running and
-# contending with the next task). Cleared when the task settles.
+# Live asyncio handles for in-flight tasks, so a task can be cancelled.
 running_tasks: Dict[str, "asyncio.Task"] = {}
 
 
@@ -41,15 +42,13 @@ class TaskStatusResponse(BaseModel):
     task_id: str
     status: str
     current_node: str | None = None
-    loop_count: int = 0
-    regression_count: int = 0
-    replan_count: int = 0
+    sandbox_loop_count: int = 0
+    compliance_loop_count: int = 0
     workspace: str
     result: Dict[str, Any] | None = None
     error: str | None = None
-    latest_verification_error: str | None = None
+    compliance_status: str | None = None
     thoughts: List[str] = []
-    # Diagnostics exposed for benchmark/monitoring consumers.
     node_history: List[Dict[str, Any]] = []
     llm_usage: List[Dict[str, Any]] = []
     docker_runs: List[Dict[str, Any]] = []
@@ -57,11 +56,7 @@ class TaskStatusResponse(BaseModel):
 
 
 async def _drive_graph(task_id: str, initial_state: Dict[str, Any]) -> Dict[str, Any]:
-    """Consume the graph stream, updating live task status as nodes run.
-
-    Returns the final file manifest. Kept separate from run_swarm_task so the
-    whole drive can be wrapped in a wall-clock deadline (asyncio.wait_for).
-    """
+    """Consume the v0.2 graph stream, updating live task status as nodes run."""
     final_manifest: Dict[str, Any] = {}
     stream = swarm_graph.astream(initial_state, stream_mode="updates")
     try:
@@ -69,19 +64,14 @@ async def _drive_graph(task_id: str, initial_state: Dict[str, Any]) -> Dict[str,
             for node_name, state_update in output.items():
                 tasks_db[task_id]["current_node"] = node_name
 
-                # Capture loop and error tracking metrics from the state update
-                if "loop_count" in state_update:
-                    tasks_db[task_id]["loop_count"] = state_update["loop_count"]
-                if "regression_count" in state_update:
-                    tasks_db[task_id]["regression_count"] = state_update[
-                        "regression_count"
-                    ]
-                if "replan_count" in state_update:
-                    tasks_db[task_id]["replan_count"] = state_update["replan_count"]
-                if "verification_errors" in state_update:
-                    tasks_db[task_id]["latest_verification_error"] = state_update[
-                        "verification_errors"
-                    ]
+                if "sandbox_loop_count" in state_update:
+                    tasks_db[task_id]["sandbox_loop_count"] = state_update["sandbox_loop_count"]
+                if "compliance_loop_count" in state_update:
+                    tasks_db[task_id]["compliance_loop_count"] = state_update["compliance_loop_count"]
+                if "compliance_status" in state_update:
+                    tasks_db[task_id]["compliance_status"] = state_update["compliance_status"]
+                if "sandbox_errors" in state_update:
+                    tasks_db[task_id]["error"] = state_update["sandbox_errors"]
                 if "file_manifest" in state_update:
                     final_manifest = state_update["file_manifest"]
                 if "thoughts" in state_update:
@@ -95,18 +85,24 @@ async def _drive_graph(task_id: str, initial_state: Dict[str, Any]) -> Dict[str,
                 if "classifier_history" in state_update:
                     tasks_db[task_id]["classifier_history"].extend(state_update["classifier_history"])
     finally:
-        # Ensure the async generator is closed promptly on cancel/deadline so a
-        # node mid-flight doesn't keep running after we've stopped consuming.
         await stream.aclose()
     return final_manifest
 
 
 async def run_swarm_task(task_id: str, prompt: str, workspace_dir: str):
     initial_state = {
-        "messages": [HumanMessage(content=prompt)],
+        "user_prompt": prompt,
         "workspace_dir": workspace_dir,
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-        "initial_prompt": prompt,
+        "file_manifest": {},
+        "sandbox_errors": "",
+        "sandbox_diagnostics": {},
+        "compliance_status": "",
+        "compliance_critique": [],
+        "sandbox_loop_count": 0,
+        "compliance_loop_count": 0,
+        "next_node": "test_architect",
+        "thoughts": [],
         "node_history": [],
         "llm_usage": [],
         "docker_runs": [],
@@ -114,40 +110,33 @@ async def run_swarm_task(task_id: str, prompt: str, workspace_dir: str):
     }
 
     try:
-        # Wrap the whole drive in a hard wall-clock deadline. This is the
-        # server-side backstop (issue #19): if the client dies without calling
-        # /cancel, the task still can't run forever and contend with the next.
         final_manifest = await asyncio.wait_for(
             _drive_graph(task_id, initial_state), timeout=SERVER_TASK_DEADLINE
         )
 
-        # The graph reaches END both on success (archivist_node → FINISH) AND on
-        # giving up (loop ceiling in deterministic_verifier, replan ceiling in
-        # error_distiller). Only the archivist is a genuine success terminal —
-        # anything else exhausted its budget with failing tests and must NOT be
-        # reported as "completed", or the runner scores a failure as PASS (#18).
         tasks_db[task_id]["result"] = final_manifest
-        if tasks_db[task_id]["current_node"] == "archivist_node":
+        final_node = tasks_db[task_id].get("current_node")
+
+        if final_node == "prompt_compliance_checker" and tasks_db[task_id].get("compliance_status") == "PASS":
             tasks_db[task_id]["status"] = "completed"
+        elif tasks_db[task_id].get("compliance_status") == "FAIL":
+            tasks_db[task_id]["status"] = "exhausted"
+            tasks_db[task_id]["error"] = (
+                tasks_db[task_id].get("error")
+                or "Compliance loop ceiling reached without passing"
+            )
         else:
             tasks_db[task_id]["status"] = "exhausted"
             tasks_db[task_id]["error"] = (
-                tasks_db[task_id].get("latest_verification_error")
-                or "Terminated without passing (loop/replan ceiling reached)"
+                tasks_db[task_id].get("error")
+                or "Pipeline terminated without passing compliance"
             )
 
     except asyncio.TimeoutError:
-        # Hit the server-side hard deadline (#19). Treated as exhaustion: it ran
-        # out of wall-clock budget, not a code crash.
         tasks_db[task_id]["status"] = "exhausted"
-        tasks_db[task_id]["error"] = (
-            f"Server task deadline ({SERVER_TASK_DEADLINE}s) exceeded"
-        )
+        tasks_db[task_id]["error"] = f"Server task deadline ({SERVER_TASK_DEADLINE}s) exceeded"
         tasks_db[task_id]["result"] = None
     except asyncio.CancelledError:
-        # Cancelled via /task/{id}/cancel. Cancellation lands at the next node
-        # boundary (between astream yields), so the task stops promptly rather
-        # than running on as an orphan.
         tasks_db[task_id]["status"] = "cancelled"
         tasks_db[task_id]["error"] = "Task cancelled"
         tasks_db[task_id]["result"] = None
@@ -156,7 +145,6 @@ async def run_swarm_task(task_id: str, prompt: str, workspace_dir: str):
         tasks_db[task_id]["status"] = "failed"
         tasks_db[task_id]["error"] = str(e)
         tasks_db[task_id]["result"] = None
-        # Preserve any diagnostic usage entries captured before the LLM failed.
         if hasattr(e, "usage_entries"):
             tasks_db[task_id]["llm_usage"].extend(getattr(e, "usage_entries", []))
     finally:
@@ -165,25 +153,21 @@ async def run_swarm_task(task_id: str, prompt: str, workspace_dir: str):
 
 @app.post("/task", response_model=TaskStatusResponse)
 async def generate_code(request: TaskRequest):
-    """
-    Accepts a code generation prompt, starts the swarm asynchronously,
-    and returns a task_id immediately.
-    """
+    """Accepts a code generation prompt, starts the swarm asynchronously,
+    and returns a task_id immediately."""
     task_id = f"task_{uuid.uuid4().hex[:8]}"
     workspace_dir = f".workspaces/{task_id}"
 
-    # Initialize task status
     tasks_db[task_id] = {
         "task_id": task_id,
         "status": "running",
         "current_node": "initializing",
-        "loop_count": 0,
-        "regression_count": 0,
-        "replan_count": 0,
+        "sandbox_loop_count": 0,
+        "compliance_loop_count": 0,
         "workspace": workspace_dir,
         "result": None,
         "error": None,
-        "latest_verification_error": None,
+        "compliance_status": None,
         "thoughts": [],
         "node_history": [],
         "llm_usage": [],
@@ -191,8 +175,6 @@ async def generate_code(request: TaskRequest):
         "classifier_history": [],
     }
 
-    # Trigger the LangGraph execution as a tracked asyncio task so it can be
-    # cancelled (BackgroundTasks gives no handle, which let timed-out tasks run on).
     running_tasks[task_id] = asyncio.create_task(
         run_swarm_task(task_id, request.prompt, workspace_dir)
     )
@@ -209,8 +191,6 @@ async def cancel_task(task_id: str):
     handle = running_tasks.get(task_id)
     if handle is not None and not handle.done():
         handle.cancel()
-        # Reflect intent immediately; run_swarm_task's CancelledError handler
-        # also sets this once cancellation is actually delivered.
         tasks_db[task_id]["status"] = "cancelled"
 
     return tasks_db[task_id]
@@ -218,10 +198,7 @@ async def cancel_task(task_id: str):
 
 @app.get("/task/{task_id}", response_model=TaskStatusResponse)
 async def get_task_status(task_id: str):
-    """
-    Retrieves the status of a given task_id.
-    If completed, the 'result' field will contain the generated files.
-    """
+    """Retrieve the status of a given task_id."""
     if task_id not in tasks_db:
         raise HTTPException(status_code=404, detail="Task not found")
 
@@ -230,7 +207,7 @@ async def get_task_status(task_id: str):
 
 @app.get("/task/{task_id}/log", response_class=PlainTextResponse)
 async def get_task_log(task_id: str):
-    """Returns the thought log as plain text — one line per node action."""
+    """Return the thought log as plain text — one line per node action."""
     if task_id not in tasks_db:
         raise HTTPException(status_code=404, detail="Task not found")
     return "\n".join(tasks_db[task_id].get("thoughts", []))

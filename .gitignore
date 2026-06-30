@@ -40,8 +40,6 @@ docker-compose.override.yml
 .aider*
 
 # Handover / internal notes (loaded into aider via .aender.conf.yml, not for the public repo)
-SESSION_NOTES.md
-SESSION_NOTES*.md
 HANDOVER.md
 
 # OS generated files

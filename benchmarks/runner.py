@@ -5,7 +5,7 @@ Benchmark runner for the Coding Module.
 Usage:
     python benchmarks/runner.py                        # run all questions
     python benchmarks/runner.py --ids fibonacci stack  # run specific questions
-    python benchmarks/runner.py --summary              # print summary of past results
+    python benchmarks/runner.py --summary              # print summary of past runs
 
 Results are appended to benchmarks/results.jsonl — one JSON line per run.
 """
@@ -77,7 +77,7 @@ def run_question(question: dict, run_id: str) -> dict:
             "llm_usage": data.get("llm_usage", []),
             "docker_runs": data.get("docker_runs", []),
             "classifier_history": data.get("classifier_history", []),
-            "latest_verification_error": data.get("latest_verification_error"),
+            "latest_verification_error": data.get("error"),
         }
 
     def _metrics_rows(result: dict, diag: dict) -> list[dict]:
@@ -130,9 +130,8 @@ def run_question(question: dict, run_id: str) -> dict:
             "elapsed_seconds": round(time.time() - start_time, 1),
             "status": "submit_error",
             "error": str(e),
-            "loop_count": 0,
-            "regression_count": 0,
-            "replan_count": 0,
+            "sandbox_loop_count": 0,
+            "compliance_loop_count": 0,
             "files_generated": 0,
             "thoughts_count": 0,
             "node_history": [],
@@ -161,7 +160,11 @@ def run_question(question: dict, run_id: str) -> dict:
         elapsed = round(time.time() - start_time, 1)
 
         if node != last_node:
-            print(f"  {elapsed:>7.1f}s  → {node}  (loops={data.get('loop_count',0)} regressions={data.get('regression_count',0)})")
+            print(
+                f"  {elapsed:>7.1f}s  → {node}  "
+                f"(sandbox_loops={data.get('sandbox_loop_count', 0)} "
+                f"compliance_loops={data.get('compliance_loop_count', 0)})"
+            )
             last_node = node
 
         if status in ("completed", "failed", "cancelled", "exhausted"):
@@ -178,16 +181,21 @@ def run_question(question: dict, run_id: str) -> dict:
                 "elapsed_seconds": elapsed,
                 "status": status,
                 "error": data.get("error"),
-                "loop_count": data.get("loop_count", 0),
-                "regression_count": data.get("regression_count", 0),
-                "replan_count": data.get("replan_count", 0),
+                "sandbox_loop_count": data.get("sandbox_loop_count", 0),
+                "compliance_loop_count": data.get("compliance_loop_count", 0),
                 "files_generated": len(files),
                 "thoughts_count": len(data.get("thoughts", [])),
+                "compliance_status": data.get("compliance_status"),
                 **diagnostics,
             }
             append_metrics(_metrics_rows(result, diagnostics))
             verdict = "PASS" if status == "completed" and files else "FAIL"
-            print(f"\n  {verdict}  in {elapsed}s  |  loops={result['loop_count']}  regressions={result['regression_count']}  files={result['files_generated']}")
+            print(
+                f"\n  {verdict}  in {elapsed}s  |  "
+                f"sandbox_loops={result['sandbox_loop_count']}  "
+                f"compliance_loops={result['compliance_loop_count']}  "
+                f"files={result['files_generated']}"
+            )
             return result
 
         time.sleep(POLL_INTERVAL)
@@ -198,8 +206,6 @@ def run_question(question: dict, run_id: str) -> dict:
     end_iso = datetime.now(timezone.utc).isoformat()
     elapsed = round(time.time() - start_time, 1)
     diagnostics = _diagnostic_fields(last_data)
-    print(f"\n  TIMEOUT after {elapsed}s — cancelled "
-          f"(last node={last_data.get('current_node')} loops={last_data.get('loop_count', 0)})")
     result = {
         "run_id": run_id,
         "question_id": qid,
@@ -210,14 +216,17 @@ def run_question(question: dict, run_id: str) -> dict:
         "elapsed_seconds": elapsed,
         "status": "timeout",
         "error": f"Timed out after {TIMEOUT}s",
-        "loop_count": last_data.get("loop_count", 0),
-        "regression_count": last_data.get("regression_count", 0),
-        "replan_count": last_data.get("replan_count", 0),
+        "sandbox_loop_count": last_data.get("sandbox_loop_count", 0),
+        "compliance_loop_count": last_data.get("compliance_loop_count", 0),
         "files_generated": len(last_data.get("result") or {}),
         "thoughts_count": len(last_data.get("thoughts", [])),
+        "compliance_status": last_data.get("compliance_status"),
         **diagnostics,
     }
     append_metrics(_metrics_rows(result, diagnostics))
+    print(f"\n  TIMEOUT after {elapsed}s — cancelled "
+          f"(last node={last_data.get('current_node')} "
+          f"sandbox_loops={last_data.get('sandbox_loop_count', 0)})")
     return result
 
 
@@ -240,8 +249,11 @@ def print_summary(results: list[dict]):
     print(f"\n{'═' * 70}")
     print(f"  RUN SUMMARY  ({results[0]['run_id']})")
     print(f"{'═' * 70}")
-    print(f"  {'ID':<20} {'DIFF':<8} {'STATUS':<10} {'TIME':>8}  {'LOOPS':>5}  {'REGR':>5}  {'FILES':>5}")
-    print(f"  {'─'*20} {'─'*8} {'─'*10} {'─'*8}  {'─'*5}  {'─'*5}  {'─'*5}")
+    print(
+        f"  {'ID':<20} {'DIFF':<8} {'STATUS':<10} {'TIME':>8}  "
+        f"{'SBOX':>4}  {'COMP':>4}  {'FILES':>5}"
+    )
+    print(f"  {'─'*20} {'─'*8} {'─'*10} {'─'*8}  {'─'*4}  {'─'*4}  {'─'*5}")
     total_elapsed = 0
     passed = 0
     for r in results:
@@ -249,8 +261,13 @@ def print_summary(results: list[dict]):
         if verdict == "PASS":
             passed += 1
         total_elapsed += r["elapsed_seconds"]
-        print(f"  {r['question_id']:<20} {r['difficulty']:<8} {verdict:<10} {r['elapsed_seconds']:>7.1f}s"
-              f"  {r['loop_count']:>5}  {r['regression_count']:>5}  {r['files_generated']:>5}")
+        print(
+            f"  {r['question_id']:<20} {r['difficulty']:<8} {verdict:<10} "
+            f"{r['elapsed_seconds']:>7.1f}s  "
+            f"{r['sandbox_loop_count']:>4}  "
+            f"{r['compliance_loop_count']:>4}  "
+            f"{r['files_generated']:>5}"
+        )
     print(f"{'─' * 70}")
     print(f"  {passed}/{len(results)} passed   total time: {total_elapsed:.1f}s   avg: {total_elapsed/len(results):.1f}s")
     print(f"{'═' * 70}\n")
@@ -264,7 +281,6 @@ def print_diagnostics(results: list[dict]):
     print(f"  DIAGNOSTIC SUMMARY  ({results[0]['run_id']})")
     print(f"{'#' * 70}")
 
-    # Aggregate LLM usage across all questions in this run.
     node_totals: dict[str, dict] = {}
     for r in results:
         for entry in r.get("llm_usage", []):
@@ -287,33 +303,45 @@ def print_diagnostics(results: list[dict]):
             node_totals[node]["total_tokens"] += entry.get("total_tokens", 0) or 0
 
     if node_totals:
-        print(f"\n  {'NODE':<22} {'CALLS':>5} {'ERRORS':>6} {'TIME':>8} {'IN_TOK':>8} {'OUT_TOK':>8} {'TOT_TOK':>8}")
-        print(f"  {'─'*22} {'─'*5} {'─'*6} {'─'*8} {'─'*8} {'─'*8} {'─'*8}")
+        print(
+            f"\n  {'NODE':<26} {'CALLS':>5} {'ERRORS':>6} {'TIME':>8} "
+            f"{'IN_TOK':>8} {'OUT_TOK':>8} {'TOT_TOK':>8}"
+        )
+        print(
+            f"  {'─'*26} {'─'*5} {'─'*6} {'─'*8} "
+            f"{'─'*8} {'─'*8} {'─'*8}"
+        )
         for node, t in sorted(node_totals.items()):
-            print(f"  {node:<22} {t['calls']:>5} {t['errors']:>6} {t['duration']:>7.1f}s"
-                  f"  {t['input_tokens']:>8}  {t['output_tokens']:>8}  {t['total_tokens']:>8}")
+            print(
+                f"  {node:<26} {t['calls']:>5} {t['errors']:>6} {t['duration']:>7.1f}s"
+                f"  {t['input_tokens']:>8}  {t['output_tokens']:>8}  {t['total_tokens']:>8}"
+            )
 
-    # Docker phase summary.
     docker_total = 0.0
     docker_count = 0
     for r in results:
         for run in r.get("docker_runs", []):
-            for key in ("install_duration_seconds", "test_duration_seconds"):
-                val = run.get(key)
-                if isinstance(val, (int, float)):
-                    docker_total += val
-                    docker_count += 1
+            val = run.get("duration_seconds")
+            if isinstance(val, (int, float)):
+                docker_total += val
+                docker_count += 1
     if docker_count:
-        print(f"\n  Docker runs: {docker_count}   total sandbox time: {docker_total:.1f}s   avg: {docker_total/docker_count:.1f}s")
+        print(
+            f"\n  Docker runs: {docker_count}   "
+            f"total sandbox time: {docker_total:.1f}s   "
+            f"avg: {docker_total/docker_count:.1f}s"
+        )
 
-    # Classifier routing summary.
     fault_counts: dict[str, int] = {}
     for r in results:
         for ch in r.get("classifier_history", []):
             fault = ch.get("fault") or "unknown"
             fault_counts[fault] = fault_counts.get(fault, 0) + 1
     if fault_counts:
-        print(f"\n  Classifier routes: {', '.join(f'{k}: {v}' for k, v in sorted(fault_counts.items()))}")
+        print(
+            f"\n  Classifier routes: "
+            f"{', '.join(f'{k}: {v}' for k, v in sorted(fault_counts.items()))}"
+        )
 
     print(f"{'#' * 70}\n")
 
@@ -336,7 +364,10 @@ def print_historical_summary():
         avg_time = sum(r["elapsed_seconds"] for r in results) / total
         label = results[0].get("label") or ""
         label_str = f"  [{label}]" if label else ""
-        print(f"  {run_id}  {ts}  {passed}/{total} passed  avg {avg_time:.1f}s{label_str}")
+        print(
+            f"  {run_id}  {ts}  {passed}/{total} passed  "
+            f"avg {avg_time:.1f}s{label_str}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -352,8 +383,7 @@ def main():
     parser.add_argument("--timeout", type=int, default=None,
                         help=f"Per-task timeout in seconds (default {TIMEOUT})")
     parser.add_argument("--label", default="",
-                        help="Short tag stored on every result row (e.g. the code state / "
-                             "fixes active) so runs are comparable later")
+                        help="Short tag stored on every result row")
     parser.add_argument("--diagnostics", action="store_true",
                         help="Print token/time diagnostic summary after the run")
     args = parser.parse_args()

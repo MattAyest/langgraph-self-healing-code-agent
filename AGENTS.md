@@ -38,6 +38,8 @@ Only read full files when the RAG results show you need the complete source.
 - Make minimal, focused changes.
 - Follow the existing style in `src/`.
 - Run tests or type checks when they exist.
-- If a change affects the API or task lifecycle, update `README.md` and `SESSION_NOTES.md`.
-- `SESSION_NOTES.md` is the source of truth for the open-issues tracker; keep it in sync with `src/`.
+- This is **v0.2** of the pipeline. The v0.1 eight-node design is preserved only in git history — do not reintroduce it.
+- If a change affects the API or task lifecycle, update `README.md` (public) and `SESSION_NOTES.md` (private agent guide).
+- `SESSION_NOTES.md` is the source of truth for the open-issues tracker and prompt-change log; keep it in sync with `src/`.
+- `SESSION_NOTES.md` is now tracked in git, so make sure it stays accurate after any prompt or workflow change.
 - If you change prompts in `src/nodes.py`, add a short note to `SESSION_NOTES.md` under the latest session so the next agent knows the prompt was touched.
